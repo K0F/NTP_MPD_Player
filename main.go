@@ -22,15 +22,16 @@ type fzfResultMsg []string
 type ntpOffsetMsg time.Duration // <--- Custom type for asynchronous NTP response
 
 type model struct {
-	client        *mpd.Client
-	playlist      []mpd.Attrs
-	currentStatus mpd.Attrs
-	err           error
-	lastSongID    string
-	cursor        int
-	musicDir      string
-	clockOffset   time.Duration // <--- Now tracks full precision duration
-	ntpStatus     string        // Displays status of cosmic synchronization
+	client            *mpd.Client
+	playlist          []mpd.Attrs
+	currentStatus     mpd.Attrs
+	err               error
+	lastSongID        string
+	cursor            int
+	musicDir          string
+	clockOffset       time.Duration // <--- Now tracks full precision duration
+	ntpStatus         string        // Displays status of cosmic synchronization
+	cursorInitialized bool
 }
 
 func initialModel() model {
@@ -235,17 +236,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		currentSongID := m.currentStatus["songid"]
 		songPos, _ := strconv.Atoi(m.currentStatus["song"])
 
-		if m.lastSongID == "" {
-			m.lastSongID = currentSongID
-			m.cursor = songPos
-			return m, syncEngine(m.client, m.clockOffset)
+		// 1. STARTUP ALIGNMENT: Run this EXACTLY once on app boot, then lock it down.
+		if !m.cursorInitialized {
+			if currentSongID != "" {
+				m.cursor = songPos
+				m.lastSongID = currentSongID
+				m.cursorInitialized = true
+			}
 		}
 
-		if currentSongID != m.lastSongID && m.playlist != nil {
+		// 2. TRACK CHANGEOVER: Only sync if we have a valid, non-empty song ID.
+		// This completely blocks momentary seek-flickers from resetting your menu.
+		if currentSongID != "" && currentSongID != m.lastSongID && m.playlist != nil {
 			trueTime := time.Now().Add(m.clockOffset)
 			_ = m.client.Seek(songPos, trueTime.Second())
 			m.lastSongID = currentSongID
-			m.cursor = songPos
 		}
 
 		return m, syncEngine(m.client, m.clockOffset)
