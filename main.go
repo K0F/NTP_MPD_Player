@@ -98,7 +98,7 @@ func initialModel(ntpOffset time.Duration) model {
 		log.Fatal("Could not connect to MPD local daemon:", err)
 	}
 
-	musicPath := os.Getenv("HOME") + "/storage/music"
+	musicPath := os.Getenv("HOME") + "/Music"
 	
 	var hardwareLatency time.Duration = 0 * time.Millisecond
 	ntpStatusMsg := "NTP Sync: Active"
