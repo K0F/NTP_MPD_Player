@@ -256,7 +256,7 @@ func (m model) View() string {
 	}
 
 	var s strings.Builder
-	s.WriteString("\n  --- ATOMIC TERMINAL MEDIA PLAYER ---\n\n")
+	s.WriteString("\n  --- NTP TERMINAL MPD PLAYER ---\n\n")
 
 	currentSongIndex := -1
 	if m.currentStatus != nil {
