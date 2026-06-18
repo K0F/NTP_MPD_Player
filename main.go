@@ -10,15 +10,15 @@ import (
 	"strings"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
 	"github.com/beevik/ntp"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/fhs/gompd/v2/mpd"
 )
 
 type statusMsg mpd.Attrs
 type playlistMsg []mpd.Attrs
 type errMsg error
-type fzfResultMsg []string 
+type fzfResultMsg []string
 type ntpOffsetMsg time.Duration // <--- Custom type for asynchronous NTP response
 
 type model struct {
@@ -28,7 +28,7 @@ type model struct {
 	err           error
 	lastSongID    string
 	cursor        int
-	musicDir      string 
+	musicDir      string
 	clockOffset   time.Duration // <--- Now tracks full precision duration
 	ntpStatus     string        // Displays status of cosmic synchronization
 }
@@ -112,19 +112,20 @@ func fetchPlaylist(client *mpd.Client) tea.Cmd {
 		return playlistMsg(list)
 	}
 }
-
 func runFzf(musicDir string) tea.Cmd {
 	return tea.ExecProcess(exec.Command("sh", "-c", fmt.Sprintf(
-		"cd %s && find . -type f -not -path '*/.*' | fzf -m > /tmp/observatory_fzf.txt", 
+		"cd %s && find . -type f -not -path '*/.*' | fzf -m > $HOME/observatory_fzf.txt",
 		musicDir,
 	)), func(err error) tea.Msg {
 		if err != nil {
 			return errMsg(err)
 		}
 
-		content, err := os.ReadFile("/tmp/observatory_fzf.txt")
+		// Read from the new Termux-safe home directory path
+		homeDir := os.Getenv("HOME")
+		content, err := os.ReadFile(homeDir + "/observatory_fzf.txt")
 		if err != nil || len(content) == 0 {
-			return fzfResultMsg(nil) 
+			return fzfResultMsg(nil)
 		}
 
 		lines := strings.Split(string(content), "\n")
@@ -148,8 +149,8 @@ func runFzf(musicDir string) tea.Cmd {
 // Fire off both the audio engine AND the network time query on boot
 func (m model) Init() tea.Cmd {
 	return tea.Batch(
-		fetchPlaylist(m.client), 
-		fetchNTP(), 
+		fetchPlaylist(m.client),
+		fetchNTP(),
 		syncEngine(m.client, m.clockOffset),
 	)
 }
@@ -174,21 +175,34 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 
 		case "up", "k":
-			if m.cursor > 0 { m.cursor-- }
+			if m.cursor > 0 {
+				m.cursor--
+			}
 
 		case "down", "j":
-			if m.cursor < len(m.playlist)-1 { m.cursor++ }
+			if m.cursor < len(m.playlist)-1 {
+				m.cursor++
+			}
+			/*
+				case "enter":
+					if len(m.playlist) > 0 && m.cursor < len(m.playlist) {
+						trueTime := time.Now().Add(m.clockOffset)
+						_ = m.client.Seek(m.cursor, trueTime.Second())
+					}
+
+			*/
 
 		case "enter":
 			if len(m.playlist) > 0 && m.cursor < len(m.playlist) {
-				trueTime := time.Now().Add(m.clockOffset)
-				_ = m.client.Seek(m.cursor, trueTime.Second())
+				_ = m.client.Play(m.cursor)
 			}
 
 		case "d":
 			if len(m.playlist) > 0 && m.cursor < len(m.playlist) {
 				_ = m.client.Delete(m.cursor, -1)
-				if m.cursor >= len(m.playlist)-1 && m.cursor > 0 { m.cursor-- }
+				if m.cursor >= len(m.playlist)-1 && m.cursor > 0 {
+					m.cursor--
+				}
 				return m, fetchPlaylist(m.client)
 			}
 
@@ -209,7 +223,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case fzfResultMsg:
 		if len(msg) > 0 {
-			for _, track := range msg { _ = m.client.Add(track) }
+			for _, track := range msg {
+				_ = m.client.Add(track)
+			}
 			_ = os.Remove("/tmp/observatory_fzf.txt")
 			return m, fetchPlaylist(m.client)
 		}
@@ -261,10 +277,14 @@ func (m model) View() string {
 
 	for i, track := range m.playlist {
 		title := track["title"]
-		if title == "" { title = track["file"] }
+		if title == "" {
+			title = track["file"]
+		}
 
 		prefix := "   "
-		if i == m.cursor { prefix = " > " }
+		if i == m.cursor {
+			prefix = " > "
+		}
 
 		if i == currentSongIndex && m.currentStatus["state"] == "play" {
 			if i == m.cursor {
