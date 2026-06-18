@@ -64,7 +64,6 @@ func fetchNTP() tea.Cmd {
 		return ntpOffsetMsg(response.ClockOffset)
 	}
 }
-
 func syncEngine(client *mpd.Client, offset time.Duration) tea.Cmd {
 	return func() tea.Msg {
 		status, err := client.Status()
@@ -74,8 +73,6 @@ func syncEngine(client *mpd.Client, offset time.Duration) tea.Cmd {
 
 		if status["state"] == "play" {
 			trueTime := time.Now().Add(offset)
-			
-			// HIGH PRECISION: Combine seconds and nanoseconds into a precise float (e.g., 12.850)
 			targetSecondOfSystem := float64(trueTime.Second()) + float64(trueTime.Nanosecond())/1e9
 
 			mpdElapsed, _ := strconv.ParseFloat(status["elapsed"], 64)
@@ -83,7 +80,6 @@ func syncEngine(client *mpd.Client, offset time.Duration) tea.Cmd {
 
 			trackSecond := math.Mod(mpdElapsed, 60)
 
-			// Calculate drift using floating-point decimals
 			drift := targetSecondOfSystem - trackSecond
 			if drift < -30 {
 				drift += 60
@@ -91,12 +87,8 @@ func syncEngine(client *mpd.Client, offset time.Duration) tea.Cmd {
 				drift -= 60
 			}
 
-			// TIGHTEN THE GATE: If drift is off by more than half a second, snap it
 			if drift > 0.5 || drift < -0.5 {
-				// Find the exact absolute timestamp the song SHOULD be at
 				idealTrackPosition := mpdElapsed + drift
-				
-				// Round to the nearest whole second since MPD's Seek takes an integer
 				targetAbsolute := int(math.Round(idealTrackPosition))
 				if targetAbsolute < 0 {
 					targetAbsolute = 0
@@ -105,7 +97,9 @@ func syncEngine(client *mpd.Client, offset time.Duration) tea.Cmd {
 			}
 		}
 
-		time.Sleep(200 * time.Millisecond)
+		// FIX: Increase this from 200ms to 500ms (or 1000ms for absolute minimum resource usage)
+		// This stops hammering Termux's UI thread and makes key presses instant!
+		time.Sleep(500 * time.Millisecond) 
 		return statusMsg(status)
 	}
 }
