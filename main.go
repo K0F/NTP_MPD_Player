@@ -103,7 +103,7 @@ func initialModel(ntpOffset time.Duration) model {
 	var hardwareLatency time.Duration = 0 * time.Millisecond
 	ntpStatusMsg := "NTP Sync: Active"
 
-	// Fixed: Proper Type Assignment for Termux Calibration
+	// Native Termux/Android Hardware Calibration
 	if os.Getenv("TERMUX_VERSION") != "" {
 		hardwareLatency = 450 * time.Millisecond
 		ntpStatusMsg = "NTP + Android Hardware Audio Profile Active (+0.450s)"
@@ -188,6 +188,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		currentSongID := m.currentStatus["songid"]
 		songPos, _ := strconv.Atoi(m.currentStatus["song"])
 
+		// Safe parsing of current track total duration to protect boundaries
+		var totalTrackDuration float64
+		if durStr, ok := m.currentStatus["duration"]; ok {
+			totalTrackDuration, _ = strconv.ParseFloat(durStr, 64)
+		}
+
 		// 1. Startup Selection Alignment (Runs exactly once on boot)
 		if !m.cursorInitialized {
 			if currentSongID != "" {
@@ -197,12 +203,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		// 2. Track Change Detection (Instantly snap to timeline on fresh track drop)
+		// 2. Track Change Detection (Instantly snap timeline on fresh track drop)
 		if currentSongID != "" && currentSongID != m.lastSongID && m.playlist != nil {
 			m.lastSongID = currentSongID
 			
 			trueTime := time.Now().Add(m.clockOffset)
 			targetSec := float64(trueTime.Second()) + float64(trueTime.Nanosecond())/1e9
+			
+			// BOUNDARY GUARD: Modulo wrapper prevents seeking past EOF on short files
+			if totalTrackDuration > 0 {
+				targetSec = math.Mod(targetSec, totalTrackDuration)
+			}
+
 			_ = m.client.Seek(songPos, int(math.Round(targetSec)))
 			
 			m.syncCooldownUntil = time.Now().Add(2500 * time.Millisecond)
@@ -224,9 +236,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				drift -= 60
 			}
 
-			// Safe integer gate window (1.2s) to cleanly handle Termux pipeline constraints
+			// Safe integer gate window (1.2s) to cleanly handle pipeline constraints
 			if drift > 1.2 || drift < -1.2 {
 				idealTrackPosition := mpdElapsed + drift
+				
+				// BOUNDARY GUARD: Continuous loop roll-over check
+				if totalTrackDuration > 0 && idealTrackPosition >= totalTrackDuration {
+					idealTrackPosition = math.Mod(idealTrackPosition, totalTrackDuration)
+				}
+
 				targetAbsolute := int(math.Round(idealTrackPosition))
 				if targetAbsolute < 0 {
 					targetAbsolute = 0
@@ -234,7 +252,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				
 				_ = m.client.Seek(songPos, targetAbsolute)
 				
-				// Engage the cooldown shield immediately to let the audio stream settle down
+				// Engage the cooldown shield immediately to let audio hardware settle
 				m.syncCooldownUntil = time.Now().Add(2500 * time.Millisecond)
 			}
 		}
@@ -247,6 +265,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+// --- Helper Functions ---
+func absDuration(d time.Duration) time.Duration {
+	if d < 0 {
+		return -d
+	}
+	return d
 }
 
 // --- The UI Renderer (View Loop) ---
