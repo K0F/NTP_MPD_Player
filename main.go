@@ -65,7 +65,6 @@ func fetchNTP() tea.Cmd {
 	}
 }
 
-// --- Core Sync Engine (Now Leveraging Virtual True Time) ---
 func syncEngine(client *mpd.Client, offset time.Duration) tea.Cmd {
 	return func() tea.Msg {
 		status, err := client.Status()
@@ -74,24 +73,31 @@ func syncEngine(client *mpd.Client, offset time.Duration) tea.Cmd {
 		}
 
 		if status["state"] == "play" {
-			// VIRTUAL TRUE TIME: Apply NTP offset directly to local system time
 			trueTime := time.Now().Add(offset)
-			targetSecondOfSystem := trueTime.Second()
+			
+			// HIGH PRECISION: Combine seconds and nanoseconds into a precise float (e.g., 12.850)
+			targetSecondOfSystem := float64(trueTime.Second()) + float64(trueTime.Nanosecond())/1e9
 
 			mpdElapsed, _ := strconv.ParseFloat(status["elapsed"], 64)
 			songPos, _ := strconv.Atoi(status["song"])
 
 			trackSecond := math.Mod(mpdElapsed, 60)
 
-			drift := float64(targetSecondOfSystem) - trackSecond
+			// Calculate drift using floating-point decimals
+			drift := targetSecondOfSystem - trackSecond
 			if drift < -30 {
 				drift += 60
 			} else if drift > 30 {
 				drift -= 60
 			}
 
-			if drift > 1.2 || drift < -1.2 {
-				targetAbsolute := int(math.Round(mpdElapsed + drift))
+			// TIGHTEN THE GATE: If drift is off by more than half a second, snap it
+			if drift > 0.5 || drift < -0.5 {
+				// Find the exact absolute timestamp the song SHOULD be at
+				idealTrackPosition := mpdElapsed + drift
+				
+				// Round to the nearest whole second since MPD's Seek takes an integer
+				targetAbsolute := int(math.Round(idealTrackPosition))
 				if targetAbsolute < 0 {
 					targetAbsolute = 0
 				}
