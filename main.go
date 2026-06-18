@@ -32,47 +32,18 @@ type model struct {
 	clockOffset       time.Duration
 	ntpStatus         string
 	cursorInitialized bool
+	syncCooldownUntil time.Time // CRITICAL: State memory to block seek-storms
 }
 
-// --- Background Synchronization Engine ---
-func syncEngine(client *mpd.Client, offset time.Duration) tea.Cmd {
+// --- Dumb Background Poller ---
+func syncEngine(client *mpd.Client) tea.Cmd {
 	return func() tea.Msg {
+		// Throttle polling thread to keep Termux light and responsive
+		time.Sleep(500 * time.Millisecond)
 		status, err := client.Status()
 		if err != nil {
 			return errMsg(err)
 		}
-
-		if status["state"] == "play" {
-			trueTime := time.Now().Add(offset)
-			
-			// Precision float tracking (e.g., 12.850 seconds)
-			targetSecondOfSystem := float64(trueTime.Second()) + float64(trueTime.Nanosecond())/1e9
-
-			mpdElapsed, _ := strconv.ParseFloat(status["elapsed"], 64)
-			songPos, _ := strconv.Atoi(status["song"])
-			trackSecond := math.Mod(mpdElapsed, 60)
-
-			// Calculate sub-second drift
-			drift := targetSecondOfSystem - trackSecond
-			if drift < -30 {
-				drift += 60
-			} else if drift > 30 {
-				drift -= 60
-			}
-
-			// Core Gate: If drift is off by more than 0.5s, execute precise alignment
-			if drift > 0.5 || drift < -0.5 {
-				idealTrackPosition := mpdElapsed + drift
-				targetAbsolute := int(math.Round(idealTrackPosition))
-				if targetAbsolute < 0 {
-					targetAbsolute = 0
-				}
-				_ = client.Seek(songPos, targetAbsolute)
-			}
-		}
-
-		// Throttled to 500ms to preserve Termux terminal CPU/UI thread processing
-		time.Sleep(500 * time.Millisecond)
 		return statusMsg(status)
 	}
 }
@@ -127,13 +98,12 @@ func initialModel(ntpOffset time.Duration) model {
 		log.Fatal("Could not connect to MPD local daemon:", err)
 	}
 
-	// Dynamic alignment with Termux mpd.conf storage structures
 	musicPath := os.Getenv("HOME") + "/storage/music"
 	
-	hardwareLatency := 0 * time.Millisecond
+	var hardwareLatency time.Duration = 0 * time.Millisecond
 	ntpStatusMsg := "NTP Sync: Active"
 
-	// Automated Hardware Profile Injection
+	// Fixed: Proper Type Assignment for Termux Calibration
 	if os.Getenv("TERMUX_VERSION") != "" {
 		hardwareLatency = 450 * time.Millisecond
 		ntpStatusMsg = "NTP + Android Hardware Audio Profile Active (+0.450s)"
@@ -146,11 +116,12 @@ func initialModel(ntpOffset time.Duration) model {
 		clockOffset:       ntpOffset + hardwareLatency,
 		ntpStatus:         ntpStatusMsg,
 		cursorInitialized: false,
+		syncCooldownUntil: time.Now(),
 	}
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(fetchPlaylist(m.client), syncEngine(m.client, m.clockOffset))
+	return tea.Batch(fetchPlaylist(m.client), syncEngine(m.client))
 }
 
 // --- The Core State Machine (Update Loop) ---
@@ -173,8 +144,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "enter":
 			if len(m.playlist) > 0 && m.cursor < len(m.playlist) {
-				// Boot target cold tracks straight into play state
 				_ = m.client.Play(m.cursor)
+				m.syncCooldownUntil = time.Now().Add(2500 * time.Millisecond)
 			}
 
 		case "a":
@@ -189,16 +160,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, fetchPlaylist(m.client)
 			}
 
-		// Micro-tuning overrides
 		case "+", "=":
 			m.clockOffset += 100 * time.Millisecond
 			m.ntpStatus = fmt.Sprintf("Manual Tuning Tweak: %.3fs", m.clockOffset.Seconds())
-			return m, syncEngine(m.client, m.clockOffset)
+			return m, syncEngine(m.client)
 
 		case "-":
 			m.clockOffset -= 100 * time.Millisecond
 			m.ntpStatus = fmt.Sprintf("Manual Tuning Tweak: %.3fs", m.clockOffset.Seconds())
-			return m, syncEngine(m.client, m.clockOffset)
+			return m, syncEngine(m.client)
 		}
 
 	case playlistMsg:
@@ -227,16 +197,49 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		// 2. Track Change Synchronization (Guarded against microsecond seek flickers)
+		// 2. Track Change Detection (Instantly snap to timeline on fresh track drop)
 		if currentSongID != "" && currentSongID != m.lastSongID && m.playlist != nil {
+			m.lastSongID = currentSongID
+			
 			trueTime := time.Now().Add(m.clockOffset)
 			targetSec := float64(trueTime.Second()) + float64(trueTime.Nanosecond())/1e9
-			
 			_ = m.client.Seek(songPos, int(math.Round(targetSec)))
-			m.lastSongID = currentSongID
+			
+			m.syncCooldownUntil = time.Now().Add(2500 * time.Millisecond)
+			return m, syncEngine(m.client)
 		}
 
-		return m, syncEngine(m.client, m.clockOffset)
+		// 3. Continuous Precise Alignment Loop (Only fires outside of the cooldown shield)
+		if m.currentStatus["state"] == "play" && time.Now().After(m.syncCooldownUntil) {
+			trueTime := time.Now().Add(m.clockOffset)
+			targetSecondOfSystem := float64(trueTime.Second()) + float64(trueTime.Nanosecond())/1e9
+
+			mpdElapsed, _ := strconv.ParseFloat(m.currentStatus["elapsed"], 64)
+			trackSecond := math.Mod(mpdElapsed, 60)
+
+			drift := targetSecondOfSystem - trackSecond
+			if drift < -30 {
+				drift += 60
+			} else if drift > 30 {
+				drift -= 60
+			}
+
+			// Safe integer gate window (1.2s) to cleanly handle Termux pipeline constraints
+			if drift > 1.2 || drift < -1.2 {
+				idealTrackPosition := mpdElapsed + drift
+				targetAbsolute := int(math.Round(idealTrackPosition))
+				if targetAbsolute < 0 {
+					targetAbsolute = 0
+				}
+				
+				_ = m.client.Seek(songPos, targetAbsolute)
+				
+				// Engage the cooldown shield immediately to let the audio stream settle down
+				m.syncCooldownUntil = time.Now().Add(2500 * time.Millisecond)
+			}
+		}
+
+		return m, syncEngine(m.client)
 
 	case errMsg:
 		m.err = msg
@@ -266,7 +269,6 @@ func (m model) View() string {
 		s.WriteString("   (No tracks loaded. Press [a] to add music via FZF)\n")
 	} else {
 		for i, track := range m.playlist {
-			// Selection Arrow Placement
 			cursorStr := "  "
 			if i == m.cursor {
 				cursorStr = " > "
@@ -279,7 +281,6 @@ func (m model) View() string {
 				title = parts[len(parts)-1]
 			}
 
-			// Active Track Green-Highlighting Rules
 			if i == currentSongIndex {
 				s.WriteString(fmt.Sprintf("%s\033[32m%d. %s\033[0m\n", cursorStr, i+1, title))
 			} else {
@@ -288,7 +289,6 @@ func (m model) View() string {
 		}
 	}
 
-	// Bottom Precision Status Infrastructure
 	s.WriteString("\n---------------------------------------------------------------\n")
 	s.WriteString(fmt.Sprintf("  %s\n", m.ntpStatus))
 	s.WriteString("  [↑/↓] Move | [Enter] Play | [a] Add | [d] Delete | [+/-] Tune | [q] Quit\n")
@@ -297,8 +297,6 @@ func (m model) View() string {
 }
 
 func main() {
-	// Simulated NTP handshake layer. This placeholder values maps out the network delta offset.
-	// Replace or integrate your native NTP pool query variable here!
 	var mockNtpOffset time.Duration = 0 * time.Millisecond
 
 	p := tea.NewProgram(initialModel(mockNtpOffset), tea.WithAltScreen())
