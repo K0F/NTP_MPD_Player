@@ -11,6 +11,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/beevik/ntp"
 	"github.com/fhs/gompd/v2/mpd"
 )
 
@@ -18,6 +19,7 @@ type statusMsg mpd.Attrs
 type playlistMsg []mpd.Attrs
 type errMsg error
 type fzfResultMsg []string 
+type ntpOffsetMsg time.Duration // <--- Custom type for asynchronous NTP response
 
 type model struct {
 	client        *mpd.Client
@@ -27,6 +29,8 @@ type model struct {
 	lastSongID    string
 	cursor        int
 	musicDir      string 
+	clockOffset   time.Duration // <--- Now tracks full precision duration
+	ntpStatus     string        // Displays status of cosmic synchronization
 }
 
 func initialModel() model {
@@ -38,14 +42,30 @@ func initialModel() model {
 	musicPath := os.Getenv("HOME") + "/Music"
 
 	return model{
-		client:   c,
-		cursor:   0,
-		musicDir: musicPath,
+		client:      c,
+		cursor:      0,
+		musicDir:    musicPath,
+		clockOffset: 0,
+		ntpStatus:   "Requesting atomic alignment...",
 	}
 }
 
-// --- Background Core Loop Engine (Fixed Minute-Boundary Math) ---
-func syncEngine(client *mpd.Client) tea.Cmd {
+// --- Asynchronous NTP Clock Ingestion ---
+func fetchNTP() tea.Cmd {
+	return func() tea.Msg {
+		// Hit global pool with a strict 3-second network drop timeout
+		response, err := ntp.QueryWithOptions("pool.ntp.org", ntp.QueryOptions{Timeout: 3 * time.Second})
+		if err != nil {
+			// Fallback to zero offset if network drops, preventing a crash
+			return ntpOffsetMsg(0)
+		}
+		// This contains the exact difference between system clock and atomic truth
+		return ntpOffsetMsg(response.ClockOffset)
+	}
+}
+
+// --- Core Sync Engine (Now Leveraging Virtual True Time) ---
+func syncEngine(client *mpd.Client, offset time.Duration) tea.Cmd {
 	return func() tea.Msg {
 		status, err := client.Status()
 		if err != nil {
@@ -53,16 +73,15 @@ func syncEngine(client *mpd.Client) tea.Cmd {
 		}
 
 		if status["state"] == "play" {
-			now := time.Now()
-			targetSecondOfSystem := now.Second()
+			// VIRTUAL TRUE TIME: Apply NTP offset directly to local system time
+			trueTime := time.Now().Add(offset)
+			targetSecondOfSystem := trueTime.Second()
 
 			mpdElapsed, _ := strconv.ParseFloat(status["elapsed"], 64)
 			songPos, _ := strconv.Atoi(status["song"])
 
-			// 1. Isolate just the sub-minute seconds of the track (0.0 to 59.99)
 			trackSecond := math.Mod(mpdElapsed, 60)
 
-			// 2. Calculate circular drift relative to the 60s clock face
 			drift := float64(targetSecondOfSystem) - trackSecond
 			if drift < -30 {
 				drift += 60
@@ -70,10 +89,7 @@ func syncEngine(client *mpd.Client) tea.Cmd {
 				drift -= 60
 			}
 
-			// 3. Tight sync threshold
 			if drift > 1.2 || drift < -1.2 {
-				// Apply the drift correction directly to the absolute elapsed position 
-				// to preserve what minute of the song we are currently playing.
 				targetAbsolute := int(math.Round(mpdElapsed + drift))
 				if targetAbsolute < 0 {
 					targetAbsolute = 0
@@ -129,13 +145,27 @@ func runFzf(musicDir string) tea.Cmd {
 	})
 }
 
+// Fire off both the audio engine AND the network time query on boot
 func (m model) Init() tea.Cmd {
-	return tea.Batch(fetchPlaylist(m.client), syncEngine(m.client))
+	return tea.Batch(
+		fetchPlaylist(m.client), 
+		fetchNTP(), 
+		syncEngine(m.client, m.clockOffset),
+	)
 }
 
-// --- The Update Loop ---
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+
+	case ntpOffsetMsg:
+		m.clockOffset = time.Duration(msg)
+		if m.clockOffset == 0 {
+			m.ntpStatus = "Offline (Using raw hardware clock)"
+		} else {
+			m.ntpStatus = fmt.Sprintf("Synced! Latency Matrix Corrected: %.3fs", m.clockOffset.Seconds())
+		}
+		// Kick the sync engine immediately with the freshly calibrated offset
+		return m, syncEngine(m.client, m.clockOffset)
 
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -144,37 +174,34 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 
 		case "up", "k":
-			if m.cursor > 0 {
-				m.cursor--
-			} else if len(m.playlist) > 0 {
-				m.cursor = len(m.playlist) - 1
-			}
+			if m.cursor > 0 { m.cursor-- }
 
 		case "down", "j":
-			if m.cursor < len(m.playlist)-1 {
-				m.cursor++
-			} else {
-				m.cursor = 0
-			}
+			if m.cursor < len(m.playlist)-1 { m.cursor++ }
 
 		case "enter":
 			if len(m.playlist) > 0 && m.cursor < len(m.playlist) {
-				targetSecond := time.Now().Second()
-				_ = m.client.Seek(m.cursor, targetSecond)
+				trueTime := time.Now().Add(m.clockOffset)
+				_ = m.client.Seek(m.cursor, trueTime.Second())
 			}
 
 		case "d":
 			if len(m.playlist) > 0 && m.cursor < len(m.playlist) {
 				_ = m.client.Delete(m.cursor, -1)
-
-				if m.cursor >= len(m.playlist)-1 && m.cursor > 0 {
-					m.cursor--
-				}
+				if m.cursor >= len(m.playlist)-1 && m.cursor > 0 { m.cursor-- }
 				return m, fetchPlaylist(m.client)
 			}
 
 		case "a":
 			return m, runFzf(m.musicDir)
+
+		// Manual overrides to micro-tune OS sound card buffer latency delays!
+		case "+", "=":
+			m.clockOffset += time.Second
+			m.ntpStatus = fmt.Sprintf("Manual Tweak: %.3fs", m.clockOffset.Seconds())
+		case "-":
+			m.clockOffset -= time.Second
+			m.ntpStatus = fmt.Sprintf("Manual Tweak: %.3fs", m.clockOffset.Seconds())
 		}
 
 	case playlistMsg:
@@ -182,9 +209,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case fzfResultMsg:
 		if len(msg) > 0 {
-			for _, track := range msg {
-				_ = m.client.Add(track)
-			}
+			for _, track := range msg { _ = m.client.Add(track) }
 			_ = os.Remove("/tmp/observatory_fzf.txt")
 			return m, fetchPlaylist(m.client)
 		}
@@ -197,17 +222,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.lastSongID == "" {
 			m.lastSongID = currentSongID
 			m.cursor = songPos
-			return m, syncEngine(m.client)
+			return m, syncEngine(m.client, m.clockOffset)
 		}
 
 		if currentSongID != m.lastSongID && m.playlist != nil {
-			targetSecond := time.Now().Second()
-			_ = m.client.Seek(songPos, targetSecond)
+			trueTime := time.Now().Add(m.clockOffset)
+			_ = m.client.Seek(songPos, trueTime.Second())
 			m.lastSongID = currentSongID
 			m.cursor = songPos
 		}
 
-		return m, syncEngine(m.client)
+		return m, syncEngine(m.client, m.clockOffset)
 
 	case errMsg:
 		m.err = msg
@@ -217,32 +242,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// --- The View (UI Layout) ---
 func (m model) View() string {
 	if m.err != nil {
 		return fmt.Sprintf("\n Error: %v\n\nPress Q to quit.", m.err)
 	}
 
 	s := "╔══════════════════════════════════════════════════════════════╗\n"
-	s += "║  KOF's SYNC MPD PLAYER                                       ║\n"
+	s += "║  OBSERVATORY COMPANION PLAYER (NTP EDITION)                  ║\n"
 	s += "╚══════════════════════════════════════════════════════════════╝\n\n"
 
-	currentSec := time.Now().Second()
-	s += fmt.Sprintf(" [Master Clock Anchor]: %ds / 60s\n\n", currentSec)
+	// Compute virtual wall clock face
+	trueTime := time.Now().Add(m.clockOffset)
+	s += fmt.Sprintf(" [Master Clock Anchor]: %ds / 60s\n", trueTime.Second())
+	s += fmt.Sprintf(" [NTP Quantum Status ]: %s\n\n", m.ntpStatus)
 	s += " CURRENT PLAYLIST:\n ─────────────────\n"
 
 	currentSongIndex, _ := strconv.Atoi(m.currentStatus["song"])
 
 	for i, track := range m.playlist {
 		title := track["title"]
-		if title == "" {
-			title = track["file"]
-		}
+		if title == "" { title = track["file"] }
 
 		prefix := "   "
-		if i == m.cursor {
-			prefix = " > "
-		}
+		if i == m.cursor { prefix = " > " }
 
 		if i == currentSongIndex && m.currentStatus["state"] == "play" {
 			if i == m.cursor {
@@ -264,7 +286,7 @@ func (m model) View() string {
 	}
 
 	s += "\n ─────────────────\n"
-	s += " [↑/↓] Move | [Enter] Play | [a] Add Track (fzf) | [d] Delete | [q] Quit\n"
+	s += " [↑/↓] Move | [Enter] Play | [a] Add | [d] Delete | [+/-] Buffer Tweak | [q] Quit\n"
 
 	return s
 }
