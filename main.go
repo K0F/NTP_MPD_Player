@@ -14,6 +14,8 @@ import (
 	"github.com/fhs/gompd/v2/mpd"
 )
 
+var version string = "0.1"
+
 // --- Bubble Tea Messages ---
 type statusMsg mpd.Attrs
 type playlistMsg []mpd.Attrs
@@ -107,6 +109,7 @@ func initialModel(ntpOffset time.Duration) model {
 	if os.Getenv("TERMUX_VERSION") != "" {
 		hardwareLatency = 450 * time.Millisecond
 		ntpStatusMsg = "NTP + Android Hardware Audio Profile Active (+0.450s)"
+		musicPath = os.Getenv("HOME") + "/storage/music"
 	}
 
 	return model{
@@ -163,12 +166,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "+", "=":
 			m.clockOffset += 100 * time.Millisecond
 			m.ntpStatus = fmt.Sprintf("Manual Tuning Tweak: %.3fs", m.clockOffset.Seconds())
-			return m, syncEngine(m.client)
+			return m, nil // FIXED: Do not spawn a duplicate concurrent poller loop thread
 
 		case "-":
 			m.clockOffset -= 100 * time.Millisecond
 			m.ntpStatus = fmt.Sprintf("Manual Tuning Tweak: %.3fs", m.clockOffset.Seconds())
-			return m, syncEngine(m.client)
+			return m, nil // FIXED: Do not spawn a duplicate concurrent poller loop thread
 		}
 
 	case playlistMsg:
@@ -210,12 +213,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			trueTime := time.Now().Add(m.clockOffset)
 			targetSec := float64(trueTime.Second()) + float64(trueTime.Nanosecond())/1e9
 			
-			// BOUNDARY GUARD: Modulo wrapper prevents seeking past EOF on short files
+			// FIXED: Guard against unpopulated pipeline metadata on file load transitions
 			if totalTrackDuration > 0 {
 				targetSec = math.Mod(targetSec, totalTrackDuration)
+				_ = m.client.Seek(songPos, int(math.Round(targetSec)))
+			} else {
+				_ = m.client.Seek(songPos, 0) // Fallback to start if track info isn't warm yet
 			}
-
-			_ = m.client.Seek(songPos, int(math.Round(targetSec)))
 			
 			m.syncCooldownUntil = time.Now().Add(2500 * time.Millisecond)
 			return m, syncEngine(m.client)
@@ -240,9 +244,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if drift > 1.2 || drift < -1.2 {
 				idealTrackPosition := mpdElapsed + drift
 				
-				// BOUNDARY GUARD: Continuous loop roll-over check
-				if totalTrackDuration > 0 && idealTrackPosition >= totalTrackDuration {
-					idealTrackPosition = math.Mod(idealTrackPosition, totalTrackDuration)
+				// FIXED: HANDS-OFF TAIL ZONE
+				// If the calculation places us within 2 seconds of the track ending, do NOT force a seek.
+				// This allows MPD to naturally drop across the finish line and advance playlists natively.
+				if totalTrackDuration > 0 && idealTrackPosition >= (totalTrackDuration-2.0) {
+					return m, syncEngine(m.client)
 				}
 
 				targetAbsolute := int(math.Round(idealTrackPosition))
@@ -282,7 +288,7 @@ func (m model) View() string {
 	}
 
 	var s strings.Builder
-	s.WriteString("\n  --- NTP TERMINAL MPD PLAYER ---\n\n")
+	s.WriteString(fmt.Sprintf("\n // NTP TERMINAL MPD PLAYER %s ////////////////////////////////////////// \n\n", version))
 
 	currentSongIndex := -1
 	if m.currentStatus != nil {
