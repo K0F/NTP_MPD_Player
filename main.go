@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"net"
 	"os"
 	"os/exec"
 	"strconv"
@@ -35,6 +36,25 @@ type model struct {
 	ntpStatus         string
 	cursorInitialized bool
 	syncCooldownUntil time.Time // CRITICAL: State memory to block seek-storms
+}
+
+// --- Direct TCP Millisecond Seek Side-Channel ---
+func preciseSeekRaw(targetSec float64) {
+	conn, err := net.Dial("tcp", "localhost:6600")
+	if err != nil {
+		return // Fail silently to keep the user interface responsive
+	}
+	defer conn.Close()
+
+	// Clear MPD's initial connection welcome handshake from the read buffer
+	buf := make([]byte, 1024)
+	if _, err := conn.Read(buf); err != nil {
+		return
+	}
+
+	// seekcur modifies the playback timeline of the current track with float precision
+	cmd := fmt.Sprintf("seekcur %.3f\n", targetSec)
+	_, _ = conn.Write([]byte(cmd))
 }
 
 // --- Dumb Background Poller ---
@@ -101,7 +121,7 @@ func initialModel(ntpOffset time.Duration) model {
 	}
 
 	musicPath := os.Getenv("HOME") + "/Music"
-	
+
 	var hardwareLatency time.Duration = 0 * time.Millisecond
 	ntpStatusMsg := "NTP Sync: Active"
 
@@ -166,12 +186,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "+", "=":
 			m.clockOffset += 100 * time.Millisecond
 			m.ntpStatus = fmt.Sprintf("Manual Tuning Tweak: %.3fs", m.clockOffset.Seconds())
-			return m, nil // FIXED: Do not spawn a duplicate concurrent poller loop thread
+			return m, nil
 
 		case "-":
 			m.clockOffset -= 100 * time.Millisecond
 			m.ntpStatus = fmt.Sprintf("Manual Tuning Tweak: %.3fs", m.clockOffset.Seconds())
-			return m, nil // FIXED: Do not spawn a duplicate concurrent poller loop thread
+			return m, nil
 		}
 
 	case playlistMsg:
@@ -209,18 +229,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// 2. Track Change Detection (Instantly snap timeline on fresh track drop)
 		if currentSongID != "" && currentSongID != m.lastSongID && m.playlist != nil {
 			m.lastSongID = currentSongID
-			
+
 			trueTime := time.Now().Add(m.clockOffset)
 			targetSec := float64(trueTime.Second()) + float64(trueTime.Nanosecond())/1e9
-			
-			// FIXED: Guard against unpopulated pipeline metadata on file load transitions
+
 			if totalTrackDuration > 0 {
 				targetSec = math.Mod(targetSec, totalTrackDuration)
-				_ = m.client.Seek(songPos, int(math.Round(targetSec)))
+				preciseSeekRaw(targetSec) // UPGRADED: Float-precision raw TCP connection execution
 			} else {
-				_ = m.client.Seek(songPos, 0) // Fallback to start if track info isn't warm yet
+				preciseSeekRaw(0.0)
 			}
-			
+
 			m.syncCooldownUntil = time.Now().Add(2500 * time.Millisecond)
 			return m, syncEngine(m.client)
 		}
@@ -240,24 +259,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				drift -= 60
 			}
 
-			// Safe integer gate window (1.2s) to cleanly handle pipeline constraints
-			if drift > 1.2 || drift < -1.2 {
+			// UPGRADED: Tightened threshold down to 300ms window due to true sub-second accuracy
+			if drift > 0.3 || drift < -0.3 {
 				idealTrackPosition := mpdElapsed + drift
-				
-				// FIXED: HANDS-OFF TAIL ZONE
+
 				// If the calculation places us within 2 seconds of the track ending, do NOT force a seek.
-				// This allows MPD to naturally drop across the finish line and advance playlists natively.
 				if totalTrackDuration > 0 && idealTrackPosition >= (totalTrackDuration-2.0) {
 					return m, syncEngine(m.client)
 				}
 
-				targetAbsolute := int(math.Round(idealTrackPosition))
-				if targetAbsolute < 0 {
-					targetAbsolute = 0
+				if idealTrackPosition < 0 {
+					idealTrackPosition = 0.0
 				}
-				
-				_ = m.client.Seek(songPos, targetAbsolute)
-				
+
+				preciseSeekRaw(idealTrackPosition) // UPGRADED: Float-precision raw TCP connection execution
+
 				// Engage the cooldown shield immediately to let audio hardware settle
 				m.syncCooldownUntil = time.Now().Add(2500 * time.Millisecond)
 			}
