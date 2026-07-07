@@ -193,32 +193,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.clockOffset -= 100 * time.Millisecond
 			m.ntpStatus = fmt.Sprintf("Manual Tuning Tweak: %.3fs", m.clockOffset.Seconds())
 			return m, nil
-
 		case "pgup":
-			pageSize := 10
+			// Posun o 1 nahoru
 			if m.cursor > 0 {
-				target := m.cursor - pageSize
-				if target < 0 {
-					target = 0
-				}
-				// Provedeme přesun v MPD
-				_ = m.client.Move(m.cursor, target)
+				target := m.cursor - 1
+				_ = m.client.Move(m.cursor, m.cursor+1, target)
 				m.cursor = target
-				// Po přesunu obnovíme playlist, aby se změnilo zobrazení
 				return m, fetchPlaylist(m.client)
 			}
 
 		case "pgdown":
-			pageSize := 10
+			// Posun o 1 dolů
 			if len(m.playlist) > 0 && m.cursor < len(m.playlist)-1 {
-				target := m.cursor + pageSize
-				if target >= len(m.playlist) {
-					target = len(m.playlist) - 1
-				}
-				// Provedeme přesun v MPD
-				_ = m.client.Move(m.cursor, target)
+				target := m.cursor + 1
+				// MPD přesune rozsah [m.cursor, m.cursor+1) na pozici target
+				_ = m.client.Move(m.cursor, m.cursor+1, target)
 				m.cursor = target
-				// Obnovíme playlist
 				return m, fetchPlaylist(m.client)
 			}
 
