@@ -38,7 +38,6 @@ type model struct {
 	syncCooldownUntil time.Time // CRITICAL: State memory to block seek-storms
 }
 
-// --- Direct TCP Millisecond Seek Side-Channel ---
 func preciseSeekRaw(targetSec float64) {
 	conn, err := net.Dial("tcp", "localhost:6600")
 	if err != nil {
