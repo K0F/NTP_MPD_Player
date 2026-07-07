@@ -18,10 +18,12 @@ import (
 var version string = "0.1"
 
 // --- Bubble Tea Messages ---
-type statusMsg mpd.Attrs
-type playlistMsg []mpd.Attrs
-type fzfResultMsg []string
-type errMsg error
+type (
+	statusMsg    mpd.Attrs
+	playlistMsg  []mpd.Attrs
+	fzfResultMsg []string
+	errMsg       error
+)
 
 // --- Core Application Model ---
 type model struct {
@@ -191,8 +193,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.clockOffset -= 100 * time.Millisecond
 			m.ntpStatus = fmt.Sprintf("Manual Tuning Tweak: %.3fs", m.clockOffset.Seconds())
 			return m, nil
-		}
+		case "pgup":
+			pageSize := 10
+			if m.cursor > pageSize {
+				m.cursor -= pageSize
+			} else {
+				m.cursor = 0
+			}
 
+		case "pgdown":
+			pageSize := 10
+			if len(m.playlist) > 0 {
+				m.cursor += pageSize
+				if m.cursor >= len(m.playlist) {
+					m.cursor = len(m.playlist) - 1
+				}
+			}
+
+		}
 	case playlistMsg:
 		m.playlist = msg
 
