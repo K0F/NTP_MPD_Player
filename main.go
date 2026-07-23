@@ -15,7 +15,7 @@ import (
 	"github.com/fhs/gompd/v2/mpd"
 )
 
-var version string = "0.1"
+var version string = "0.2"
 
 // --- Bubble Tea Messages ---
 type (
@@ -38,6 +38,7 @@ type model struct {
 	ntpStatus         string
 	cursorInitialized bool
 	syncCooldownUntil time.Time // CRITICAL: State memory to block seek-storms
+	termHeight        int       // Dynamická výška okna pro multipage výpočet
 }
 
 func preciseSeekRaw(targetSec float64) {
@@ -141,6 +142,7 @@ func initialModel(ntpOffset time.Duration) model {
 		ntpStatus:         ntpStatusMsg,
 		cursorInitialized: false,
 		syncCooldownUntil: time.Now(),
+		termHeight:        0, // Nastaví se dynamicky při prvním renderu
 	}
 }
 
@@ -151,6 +153,10 @@ func (m model) Init() tea.Cmd {
 // --- The Core State Machine (Update Loop) ---
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+
+	case tea.WindowSizeMsg:
+		m.termHeight = msg.Height
+		return m, nil
 
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -184,6 +190,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, fetchPlaylist(m.client)
 			}
 
+		case "delete":
+			if len(m.playlist) > 0 {
+				_ = m.client.Clear()
+				m.cursor = 0
+				return m, fetchPlaylist(m.client)
+			}
+
 		case "+", "=":
 			m.clockOffset += 100 * time.Millisecond
 			m.ntpStatus = fmt.Sprintf("Manual Tuning Tweak: %.3fs", m.clockOffset.Seconds())
@@ -193,8 +206,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.clockOffset -= 100 * time.Millisecond
 			m.ntpStatus = fmt.Sprintf("Manual Tuning Tweak: %.3fs", m.clockOffset.Seconds())
 			return m, nil
+
 		case "pgup":
-			// Posun o 1 nahoru
 			if m.cursor > 0 {
 				target := m.cursor - 1
 				_ = m.client.Move(m.cursor, m.cursor+1, target)
@@ -203,16 +216,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "pgdown":
-			// Posun o 1 dolů
 			if len(m.playlist) > 0 && m.cursor < len(m.playlist)-1 {
 				target := m.cursor + 1
-				// MPD přesune rozsah [m.cursor, m.cursor+1) na pozici target
 				_ = m.client.Move(m.cursor, m.cursor+1, target)
 				m.cursor = target
 				return m, fetchPlaylist(m.client)
 			}
-
 		}
+
 	case playlistMsg:
 		m.playlist = msg
 
@@ -230,13 +241,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		currentSongID := m.currentStatus["songid"]
 		songPos, _ := strconv.Atoi(m.currentStatus["song"])
 
-		// Safe parsing of current track total duration to protect boundaries
 		var totalTrackDuration float64
 		if durStr, ok := m.currentStatus["duration"]; ok {
 			totalTrackDuration, _ = strconv.ParseFloat(durStr, 64)
 		}
 
-		// 1. Startup Selection Alignment (Runs exactly once on boot)
 		if !m.cursorInitialized {
 			if currentSongID != "" {
 				m.cursor = songPos
@@ -245,7 +254,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		// 2. Track Change Detection (Instantly snap timeline on fresh track drop)
 		if currentSongID != "" && currentSongID != m.lastSongID && m.playlist != nil {
 			m.lastSongID = currentSongID
 
@@ -254,7 +262,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			if totalTrackDuration > 0 {
 				targetSec = math.Mod(targetSec, totalTrackDuration)
-				preciseSeekRaw(targetSec) // UPGRADED: Float-precision raw TCP connection execution
+				preciseSeekRaw(targetSec)
 			} else {
 				preciseSeekRaw(0.0)
 			}
@@ -263,7 +271,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, syncEngine(m.client)
 		}
 
-		// 3. Continuous Precise Alignment Loop (Only fires outside of the cooldown shield)
 		if m.currentStatus["state"] == "play" && time.Now().After(m.syncCooldownUntil) {
 			trueTime := time.Now().Add(m.clockOffset)
 			targetSecondOfSystem := float64(trueTime.Second()) + float64(trueTime.Nanosecond())/1e9
@@ -278,11 +285,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				drift -= 60
 			}
 
-			// UPGRADED: Tightened threshold down to 300ms window due to true sub-second accuracy
 			if drift > 0.3 || drift < -0.3 {
 				idealTrackPosition := mpdElapsed + drift
 
-				// If the calculation places us within 2 seconds of the track ending, do NOT force a seek.
 				if totalTrackDuration > 0 && idealTrackPosition >= (totalTrackDuration-2.0) {
 					return m, syncEngine(m.client)
 				}
@@ -291,9 +296,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					idealTrackPosition = 0.0
 				}
 
-				preciseSeekRaw(idealTrackPosition) // UPGRADED: Float-precision raw TCP connection execution
-
-				// Engage the cooldown shield immediately to let audio hardware settle
+				preciseSeekRaw(idealTrackPosition)
 				m.syncCooldownUntil = time.Now().Add(2500 * time.Millisecond)
 			}
 		}
@@ -335,7 +338,26 @@ func (m model) View() string {
 	if len(m.playlist) == 0 {
 		s.WriteString("   (No tracks loaded. Press [a] to add music via FZF)\n")
 	} else {
-		for i, track := range m.playlist {
+		// Dynamický výpočet velikosti stránky podle výšky terminálu
+		// Rezerva 9 řádků je pro záhlaví, patičku, stavové řádky a stránkovací info
+		pageSize := 10
+		if m.termHeight > 9 {
+			pageSize = m.termHeight - 9
+		}
+
+		// Výpočet indexů pro aktuální stránku tak, aby kurzor byl vždy viditelný
+		startIdx := (m.cursor / pageSize) * pageSize
+		endIdx := startIdx + pageSize
+		if endIdx > len(m.playlist) {
+			endIdx = len(m.playlist)
+		}
+
+		totalPages := int(math.Ceil(float64(len(m.playlist)) / float64(pageSize)))
+		currentPage := (startIdx / pageSize) + 1
+
+		// Vykreslení pouze songů na aktuální stránce
+		for i := startIdx; i < endIdx; i++ {
+			track := m.playlist[i]
 			cursorStr := "  "
 			if i == m.cursor {
 				cursorStr = " > "
@@ -354,11 +376,14 @@ func (m model) View() string {
 				s.WriteString(fmt.Sprintf("%s%d. %s\n", cursorStr, i+1, title))
 			}
 		}
+
+		// Zobrazení navigační lišty stránek
+		s.WriteString(fmt.Sprintf("\n  [ Strana %d / %d | Zobrazeno %d-%d z %d ]\n", currentPage, totalPages, startIdx+1, endIdx, len(m.playlist)))
 	}
 
 	s.WriteString("\n---------------------------------------------------------------\n")
 	s.WriteString(fmt.Sprintf("  %s\n", m.ntpStatus))
-	s.WriteString("  [↑/↓] Move | [Enter] Play | [a] Add | [d] Delete | [+/-] Tune | [q] Quit\n")
+	s.WriteString("  [↑/↓] Move | [Enter] Play | [a] Add | [d] Del Item | [Delete] Clear All | [q] Quit\n")
 
 	return s.String()
 }
