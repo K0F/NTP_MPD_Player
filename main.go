@@ -5,6 +5,8 @@ import (
 	"log"
 	"math"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"strconv"
@@ -41,6 +43,54 @@ type model struct {
 	syncCooldownUntil time.Time
 	termHeight        int
 	termWidth         int
+}
+
+// --- Icecast Metadata Push ---
+
+// icecastCfg holds the connection details for the Icecast source.
+var icecastCfg = struct {
+	host     string
+	port     string
+	mount    string
+	password string
+	user     string
+}{
+	host:     "192.168.1.101",
+	port:     "9000",
+	mount:    "/radio.mp3",
+	password: "cigareta",
+	user:     "source",
+}
+
+// pushIcecastMeta sends the current track title to the Icecast admin metadata endpoint.
+// It runs in a goroutine so it never blocks the TUI.
+func pushIcecastMeta(artist, title string) {
+	go func() {
+		song := title
+		if artist != "" {
+			song = artist + " - " + title
+		}
+
+		endpoint := fmt.Sprintf("http://%s:%s/admin/metadata", icecastCfg.host, icecastCfg.port)
+		req, err := http.NewRequest("GET", endpoint, nil)
+		if err != nil {
+			return
+		}
+
+		q := url.Values{}
+		q.Set("mount", icecastCfg.mount)
+		q.Set("mode", "updinfo")
+		q.Set("song", song)
+		req.URL.RawQuery = q.Encode()
+		req.SetBasicAuth(icecastCfg.user, icecastCfg.password)
+
+		client := &http.Client{Timeout: 3 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			return
+		}
+		resp.Body.Close()
+	}()
 }
 
 // --- Audio Control Helpers ---
@@ -378,6 +428,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		if currentSongID != "" && currentSongID != m.lastSongID && m.playlist != nil {
 			m.lastSongID = currentSongID
+
+			// Push track metadata to Icecast when song changes
+			if songPos >= 0 && songPos < len(m.playlist) {
+				track := m.playlist[songPos]
+				artist := track["artist"]
+				title := track["title"]
+				if title == "" {
+					parts := strings.Split(track["file"], "/")
+					title = parts[len(parts)-1]
+				}
+				pushIcecastMeta(artist, title)
+			}
 
 			trueTime := time.Now().Add(m.clockOffset)
 			targetSec := float64(trueTime.Second()) + float64(trueTime.Nanosecond())/1e9
