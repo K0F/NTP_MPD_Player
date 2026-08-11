@@ -76,6 +76,70 @@ func ensureOutputsEnabled(client *mpd.Client) {
 	}
 }
 
+// --- Toggle Broadcast (Icecast / Second MPD Output) ---
+func toggleBroadcast(client *mpd.Client) (bool, error) {
+	outputs, err := client.ListOutputs()
+	if err != nil {
+		return false, err
+	}
+	var targetID int = -1
+	var currentlyEnabled bool = false
+
+	for _, out := range outputs {
+		idStr, hasID := out["outputid"]
+		name, _ := out["outputname"]
+		enabled, _ := out["outputenabled"]
+
+		if hasID && (strings.Contains(strings.ToLower(name), "icecast") || strings.Contains(strings.ToLower(name), "stream") || idStr == "1") {
+			if id, err := strconv.Atoi(idStr); err == nil {
+				targetID = id
+				currentlyEnabled = (enabled == "1" || enabled == "true")
+				break
+			}
+		}
+	}
+
+	if targetID == -1 && len(outputs) > 1 {
+		if idStr, ok := outputs[1]["outputid"]; ok {
+			if id, err := strconv.Atoi(idStr); err == nil {
+				targetID = id
+				enabled, _ := outputs[1]["outputenabled"]
+				currentlyEnabled = (enabled == "1" || enabled == "true")
+			}
+		}
+	}
+
+	if targetID == -1 {
+		return false, fmt.Errorf("no radio stream output found")
+	}
+
+	if currentlyEnabled {
+		err := client.DisableOutput(targetID)
+		return false, err
+	} else {
+		err := client.EnableOutput(targetID)
+		return true, err
+	}
+}
+
+// --- Check if Broadcast output is active ---
+func isBroadcastActive(client *mpd.Client) bool {
+	outputs, err := client.ListOutputs()
+	if err != nil {
+		return false
+	}
+	for _, out := range outputs {
+		idStr, _ := out["outputid"]
+		name, _ := out["outputname"]
+		enabled, _ := out["outputenabled"]
+
+		if strings.Contains(strings.ToLower(name), "icecast") || strings.Contains(strings.ToLower(name), "stream") || idStr == "1" {
+			return enabled == "1" || enabled == "true"
+		}
+	}
+	return false
+}
+
 // --- Dumb Background Poller ---
 func syncEngine(client *mpd.Client) tea.Cmd {
 	return func() tea.Msg {
@@ -204,6 +268,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "o":
 			ensureOutputsEnabled(m.client)
 			m.ntpStatus = "Audio Outputs Re-enabled"
+			return m, nil
+
+		case "b", "r":
+			onAir, err := toggleBroadcast(m.client)
+			if err != nil {
+				m.ntpStatus = fmt.Sprintf("Broadcast Error: %v", err)
+			} else if onAir {
+				m.ntpStatus = "🔴 BROADCAST: ON AIR (Icecast Active)"
+			} else {
+				m.ntpStatus = "⚪ BROADCAST: OFF AIR (Icecast Muted)"
+			}
 			return m, nil
 
 		case "a":
@@ -363,7 +438,11 @@ func (m model) View() string {
 	}
 
 	var s strings.Builder
-	s.WriteString(fmt.Sprintf("\n // NTP TERMINAL MPD PLAYER %s ////////////////////////////////////////// \n\n", version))
+	airStatus := "\033[90m[ ⚪ OFF AIR ]\033[0m"
+	if isBroadcastActive(m.client) {
+		airStatus = "\033[1;31m[ 🔴 ON AIR ]\033[0m"
+	}
+	s.WriteString(fmt.Sprintf("\n // NTP TERMINAL MPD PLAYER %s // %s ///////////////////// \n\n", version, airStatus))
 
 	currentSongIndex := -1
 	if m.currentStatus != nil {
@@ -420,7 +499,7 @@ func (m model) View() string {
 
 	s.WriteString("\n---------------------------------------------------------------\n")
 	s.WriteString(fmt.Sprintf("  %s\n", m.ntpStatus))
-	s.WriteString("  [↑/↓] Move | [Enter] Play | [a] Add | [d] Del Item | [Delete] Clear All | [q] Quit\n")
+	s.WriteString("  [↑/↓] Move | [Enter] Play | [a] Add | [b/r] On-Air Radio | [d] Del | [o] Audio Reset | [q] Quit\n")
 
 	return s.String()
 }
