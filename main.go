@@ -17,7 +17,7 @@ import (
 
 var version string = "0.2"
 
-// --- Bubble Tea Messages ---
+// --- Message Types ---
 type (
 	statusMsg    mpd.Attrs
 	playlistMsg  []mpd.Attrs
@@ -25,7 +25,7 @@ type (
 	errMsg       error
 )
 
-// --- Core Application Model ---
+// --- Application Model ---
 type model struct {
 	client            *mpd.Client
 	playlist          []mpd.Attrs
@@ -37,29 +37,27 @@ type model struct {
 	clockOffset       time.Duration
 	ntpStatus         string
 	cursorInitialized bool
-	syncCooldownUntil time.Time // CRITICAL: State memory to block seek-storms
-	termHeight        int       // Dynamic window height calculation
+	syncCooldownUntil time.Time
+	termHeight        int
 }
 
+// --- Audio Control Helpers ---
 func preciseSeekRaw(targetSec float64) {
 	conn, err := net.Dial("tcp", "localhost:6600")
 	if err != nil {
-		return // Fail silently to keep the user interface responsive
+		return
 	}
 	defer conn.Close()
 
-	// Clear MPD's initial connection welcome handshake from the read buffer
 	buf := make([]byte, 1024)
 	if _, err := conn.Read(buf); err != nil {
 		return
 	}
 
-	// seekcur modifies the playback timeline of the current track with float precision
 	cmd := fmt.Sprintf("seekcur %.3f\n", targetSec)
 	_, _ = conn.Write([]byte(cmd))
 }
 
-// --- Ensure Audio Outputs are Enabled ---
 func ensureOutputsEnabled(client *mpd.Client) {
 	outputs, err := client.ListOutputs()
 	if err != nil {
@@ -76,7 +74,6 @@ func ensureOutputsEnabled(client *mpd.Client) {
 	}
 }
 
-// --- Toggle Broadcast (Icecast / Second MPD Output) ---
 func toggleBroadcast(client *mpd.Client) (bool, error) {
 	outputs, err := client.ListOutputs()
 	if err != nil {
@@ -122,7 +119,6 @@ func toggleBroadcast(client *mpd.Client) (bool, error) {
 	}
 }
 
-// --- Check if Broadcast output is active ---
 func isBroadcastActive(client *mpd.Client) bool {
 	outputs, err := client.ListOutputs()
 	if err != nil {
@@ -140,10 +136,9 @@ func isBroadcastActive(client *mpd.Client) bool {
 	return false
 }
 
-// --- Dumb Background Poller ---
+// --- Background Polling Commands ---
 func syncEngine(client *mpd.Client) tea.Cmd {
 	return func() tea.Msg {
-		// Throttle polling thread to keep Termux light and responsive
 		time.Sleep(500 * time.Millisecond)
 		status, err := client.Status()
 		if err != nil {
@@ -153,7 +148,6 @@ func syncEngine(client *mpd.Client) tea.Cmd {
 	}
 }
 
-// --- Fetch Current MPD Playlist ---
 func fetchPlaylist(client *mpd.Client) tea.Cmd {
 	return func() tea.Msg {
 		list, err := client.PlaylistInfo(-1, -1)
@@ -164,15 +158,13 @@ func fetchPlaylist(client *mpd.Client) tea.Cmd {
 	}
 }
 
-// --- Termux Native FZF File Browser ---
+// --- FZF Integration ---
 func runFzf(musicDir string) tea.Cmd {
 	return tea.ExecProcess(exec.Command("sh", "-c", fmt.Sprintf(
 		"cd %s && find . -type f -not -path '*/.*' | fzf -m > $HOME/observatory_fzf.txt",
 		musicDir,
 	)), func(err error) tea.Msg {
-		// If user presses Esc in fzf, it exits with status 1. Ignore this as a non-fatal cancellation.
 		if err != nil {
-			// Check if it's just a normal fzf exit (cancelled)
 			homeDir := os.Getenv("HOME")
 			_ = os.Remove(homeDir + "/observatory_fzf.txt")
 			return fzfResultMsg(nil)
@@ -200,20 +192,17 @@ func runFzf(musicDir string) tea.Cmd {
 	})
 }
 
-// --- Application Initialization ---
+// --- Model Initialization ---
 func initialModel(ntpOffset time.Duration) model {
 	c, err := mpd.Dial("tcp", "localhost:6600")
 	if err != nil {
 		log.Fatal("Could not connect to MPD local daemon:", err)
 	}
 
-	//musicPath := os.Getenv("HOME") + "/Music"
 	musicPath := "/mnt/data/recordings"
-
 	var hardwareLatency time.Duration = 0 * time.Millisecond
 	ntpStatusMsg := "NTP Sync: Active"
 
-	// Native Termux/Android Hardware Calibration
 	if os.Getenv("TERMUX_VERSION") != "" {
 		hardwareLatency = 450 * time.Millisecond
 		ntpStatusMsg = "NTP + Android Hardware Audio Profile Active (+0.450s)"
@@ -228,7 +217,7 @@ func initialModel(ntpOffset time.Duration) model {
 		ntpStatus:         ntpStatusMsg,
 		cursorInitialized: false,
 		syncCooldownUntil: time.Now(),
-		termHeight:        0, // Set dynamically on first render
+		termHeight:        0,
 	}
 }
 
@@ -236,7 +225,7 @@ func (m model) Init() tea.Cmd {
 	return tea.Batch(fetchPlaylist(m.client), syncEngine(m.client))
 }
 
-// --- The Core State Machine (Update Loop) ---
+// --- State Update Loop ---
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 
@@ -336,7 +325,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			for _, track := range msg {
 				err := m.client.Add(track)
 				if err != nil {
-					// Fallback for unindexed/new files: update MPD DB and retry Add
 					_, _ = m.client.Update(track)
 					_ = m.client.Add(track)
 				}
@@ -423,15 +411,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// --- Helper Functions ---
-func absDuration(d time.Duration) time.Duration {
-	if d < 0 {
-		return -d
-	}
-	return d
-}
-
-// --- The UI Renderer (View Loop) ---
+// --- View Renderer ---
 func (m model) View() string {
 	if m.err != nil {
 		return fmt.Sprintf("\n  Error encountered: %v\n\n  Press 'q' to exit.", m.err)
@@ -454,14 +434,11 @@ func (m model) View() string {
 	if len(m.playlist) == 0 {
 		s.WriteString("   (No tracks loaded. Press [a] to add music via FZF)\n")
 	} else {
-		// Dynamic page size calculation based on terminal height
-		// Reserve 9 lines for header, footer, status bar, and pagination info
 		pageSize := 10
 		if m.termHeight > 9 {
 			pageSize = m.termHeight - 9
 		}
 
-		// Calculate indices for current page so cursor remains visible
 		startIdx := (m.cursor / pageSize) * pageSize
 		endIdx := startIdx + pageSize
 		if endIdx > len(m.playlist) {
@@ -471,7 +448,6 @@ func (m model) View() string {
 		totalPages := int(math.Ceil(float64(len(m.playlist)) / float64(pageSize)))
 		currentPage := (startIdx / pageSize) + 1
 
-		// Render songs for current page
 		for i := startIdx; i < endIdx; i++ {
 			track := m.playlist[i]
 			cursorStr := "  "
@@ -493,7 +469,6 @@ func (m model) View() string {
 			}
 		}
 
-		// Page navigation bar
 		s.WriteString(fmt.Sprintf("\n  [ Page %d / %d | Shown %d-%d of %d ]\n", currentPage, totalPages, startIdx+1, endIdx, len(m.playlist)))
 	}
 
