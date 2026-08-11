@@ -59,6 +59,23 @@ func preciseSeekRaw(targetSec float64) {
 	_, _ = conn.Write([]byte(cmd))
 }
 
+// --- Ensure Audio Outputs are Enabled ---
+func ensureOutputsEnabled(client *mpd.Client) {
+	outputs, err := client.ListOutputs()
+	if err != nil {
+		return
+	}
+	for _, out := range outputs {
+		if enabled, ok := out["outputenabled"]; ok && (enabled == "0" || enabled == "false") {
+			if idStr, ok := out["outputid"]; ok {
+				if id, err := strconv.Atoi(idStr); err == nil {
+					_ = client.EnableOutput(id)
+				}
+			}
+		}
+	}
+}
+
 // --- Dumb Background Poller ---
 func syncEngine(client *mpd.Client) tea.Cmd {
 	return func() tea.Msg {
@@ -89,8 +106,12 @@ func runFzf(musicDir string) tea.Cmd {
 		"cd %s && find . -type f -not -path '*/.*' | fzf -m > $HOME/observatory_fzf.txt",
 		musicDir,
 	)), func(err error) tea.Msg {
+		// If user presses Esc in fzf, it exits with status 1. Ignore this as a non-fatal cancellation.
 		if err != nil {
-			return errMsg(err)
+			// Check if it's just a normal fzf exit (cancelled)
+			homeDir := os.Getenv("HOME")
+			_ = os.Remove(homeDir + "/observatory_fzf.txt")
+			return fzfResultMsg(nil)
 		}
 
 		homeDir := os.Getenv("HOME")
@@ -122,7 +143,8 @@ func initialModel(ntpOffset time.Duration) model {
 		log.Fatal("Could not connect to MPD local daemon:", err)
 	}
 
-	musicPath := os.Getenv("HOME") + "/Music"
+	//musicPath := os.Getenv("HOME") + "/Music"
+	musicPath := "/mnt/data/recordings"
 
 	var hardwareLatency time.Duration = 0 * time.Millisecond
 	ntpStatusMsg := "NTP Sync: Active"
@@ -174,9 +196,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "enter":
 			if len(m.playlist) > 0 && m.cursor < len(m.playlist) {
+				ensureOutputsEnabled(m.client)
 				_ = m.client.Play(m.cursor)
 				m.syncCooldownUntil = time.Now().Add(2500 * time.Millisecond)
 			}
+
+		case "o":
+			ensureOutputsEnabled(m.client)
+			m.ntpStatus = "Audio Outputs Re-enabled"
+			return m, nil
 
 		case "a":
 			return m, runFzf(m.musicDir)
@@ -229,8 +257,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case fzfResultMsg:
 		if len(msg) > 0 {
+			ensureOutputsEnabled(m.client)
 			for _, track := range msg {
-				_ = m.client.Add(track)
+				err := m.client.Add(track)
+				if err != nil {
+					// Fallback for unindexed/new files: update MPD DB and retry Add
+					_, _ = m.client.Update(track)
+					_ = m.client.Add(track)
+				}
 			}
 			_ = os.Remove(os.Getenv("HOME") + "/observatory_fzf.txt")
 			return m, fetchPlaylist(m.client)
@@ -238,6 +272,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case statusMsg:
 		m.currentStatus = mpd.Attrs(msg)
+		if errStr, ok := m.currentStatus["error"]; ok && errStr != "" {
+			ensureOutputsEnabled(m.client)
+		}
 		currentSongID := m.currentStatus["songid"]
 		songPos, _ := strconv.Atoi(m.currentStatus["song"])
 
