@@ -38,7 +38,7 @@ type model struct {
 	ntpStatus         string
 	cursorInitialized bool
 	syncCooldownUntil time.Time // CRITICAL: State memory to block seek-storms
-	termHeight        int       // Dynamická výška okna pro multipage výpočet
+	termHeight        int       // Dynamic window height calculation
 }
 
 func preciseSeekRaw(targetSec float64) {
@@ -228,7 +228,7 @@ func initialModel(ntpOffset time.Duration) model {
 		ntpStatus:         ntpStatusMsg,
 		cursorInitialized: false,
 		syncCooldownUntil: time.Now(),
-		termHeight:        0, // Nastaví se dynamicky při prvním renderu
+		termHeight:        0, // Set dynamically on first render
 	}
 }
 
@@ -275,9 +275,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if err != nil {
 				m.ntpStatus = fmt.Sprintf("Broadcast Error: %v", err)
 			} else if onAir {
-				m.ntpStatus = "🔴 BROADCAST: ON AIR (Icecast Active)"
+				m.ntpStatus = "[ON AIR] Broadcast Active (Icecast)"
 			} else {
-				m.ntpStatus = "⚪ BROADCAST: OFF AIR (Icecast Muted)"
+				m.ntpStatus = "[OFF AIR] Broadcast Muted (Icecast)"
 			}
 			return m, nil
 
@@ -438,9 +438,9 @@ func (m model) View() string {
 	}
 
 	var s strings.Builder
-	airStatus := "\033[90m[ ⚪ OFF AIR ]\033[0m"
+	airStatus := "\033[90m[ OFF AIR ]\033[0m"
 	if isBroadcastActive(m.client) {
-		airStatus = "\033[1;31m[ 🔴 ON AIR ]\033[0m"
+		airStatus = "\033[1;31m[ ON AIR ]\033[0m"
 	}
 	s.WriteString(fmt.Sprintf("\n // NTP TERMINAL MPD PLAYER %s // %s ///////////////////// \n\n", version, airStatus))
 
@@ -454,14 +454,14 @@ func (m model) View() string {
 	if len(m.playlist) == 0 {
 		s.WriteString("   (No tracks loaded. Press [a] to add music via FZF)\n")
 	} else {
-		// Dynamický výpočet velikosti stránky podle výšky terminálu
-		// Rezerva 9 řádků je pro záhlaví, patičku, stavové řádky a stránkovací info
+		// Dynamic page size calculation based on terminal height
+		// Reserve 9 lines for header, footer, status bar, and pagination info
 		pageSize := 10
 		if m.termHeight > 9 {
 			pageSize = m.termHeight - 9
 		}
 
-		// Výpočet indexů pro aktuální stránku tak, aby kurzor byl vždy viditelný
+		// Calculate indices for current page so cursor remains visible
 		startIdx := (m.cursor / pageSize) * pageSize
 		endIdx := startIdx + pageSize
 		if endIdx > len(m.playlist) {
@@ -471,7 +471,7 @@ func (m model) View() string {
 		totalPages := int(math.Ceil(float64(len(m.playlist)) / float64(pageSize)))
 		currentPage := (startIdx / pageSize) + 1
 
-		// Vykreslení pouze songů na aktuální stránce
+		// Render songs for current page
 		for i := startIdx; i < endIdx; i++ {
 			track := m.playlist[i]
 			cursorStr := "  "
@@ -493,13 +493,13 @@ func (m model) View() string {
 			}
 		}
 
-		// Zobrazení navigační lišty stránek
-		s.WriteString(fmt.Sprintf("\n  [ Strana %d / %d | Zobrazeno %d-%d z %d ]\n", currentPage, totalPages, startIdx+1, endIdx, len(m.playlist)))
+		// Page navigation bar
+		s.WriteString(fmt.Sprintf("\n  [ Page %d / %d | Shown %d-%d of %d ]\n", currentPage, totalPages, startIdx+1, endIdx, len(m.playlist)))
 	}
 
 	s.WriteString("\n---------------------------------------------------------------\n")
 	s.WriteString(fmt.Sprintf("  %s\n", m.ntpStatus))
-	s.WriteString("  [↑/↓] Move | [Enter] Play | [a] Add | [b/r] On-Air Radio | [d] Del | [o] Audio Reset | [q] Quit\n")
+	s.WriteString("  [k/j] Move | [Enter] Play | [a] Add | [b/r] On-Air Radio | [d] Del | [o] Audio Reset | [q] Quit\n")
 
 	return s.String()
 }
