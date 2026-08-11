@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	ntplib "github.com/beevik/ntp"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/fhs/gompd/v2/mpd"
 )
@@ -39,6 +40,7 @@ type model struct {
 	cursorInitialized bool
 	syncCooldownUntil time.Time
 	termHeight        int
+	termWidth         int
 }
 
 // --- Audio Control Helpers ---
@@ -136,6 +138,25 @@ func isBroadcastActive(client *mpd.Client) bool {
 	return false
 }
 
+func renderHeader(version string, onAir bool, width int) string {
+	left := fmt.Sprintf(" // NTP TERMINAL MPD PLAYER v%s ", version)
+	statusText := "[ OFF AIR ]"
+	statusFormatted := "\033[90m[ OFF AIR ]\033[0m"
+	if onAir {
+		statusText = "[ ON AIR ]"
+		statusFormatted = "\033[1;31m[ ON AIR ]\033[0m"
+	}
+	rightLen := len(statusText) + 3
+
+	fillLen := width - len(left) - rightLen
+	if fillLen < 2 {
+		fillLen = 2
+	}
+	fill := strings.Repeat("/", fillLen)
+
+	return fmt.Sprintf("\n%s%s %s //\n\n", left, fill, statusFormatted)
+}
+
 // --- Background Polling Commands ---
 func syncEngine(client *mpd.Client) tea.Cmd {
 	return func() tea.Msg {
@@ -193,7 +214,7 @@ func runFzf(musicDir string) tea.Cmd {
 }
 
 // --- Model Initialization ---
-func initialModel(ntpOffset time.Duration) model {
+func initialModel(ntpOffset time.Duration, ntpMsg string) model {
 	c, err := mpd.Dial("tcp", "localhost:6600")
 	if err != nil {
 		log.Fatal("Could not connect to MPD local daemon:", err)
@@ -201,11 +222,10 @@ func initialModel(ntpOffset time.Duration) model {
 
 	musicPath := "/mnt/data/recordings"
 	var hardwareLatency time.Duration = 0 * time.Millisecond
-	ntpStatusMsg := "NTP Sync: Active"
 
 	if os.Getenv("TERMUX_VERSION") != "" {
 		hardwareLatency = 450 * time.Millisecond
-		ntpStatusMsg = "NTP + Android Hardware Audio Profile Active (+0.450s)"
+		ntpMsg = "NTP + Android Hardware Audio Profile Active (+0.450s)"
 		musicPath = os.Getenv("HOME") + "/storage/music"
 	}
 
@@ -214,10 +234,11 @@ func initialModel(ntpOffset time.Duration) model {
 		cursor:            0,
 		musicDir:          musicPath,
 		clockOffset:       ntpOffset + hardwareLatency,
-		ntpStatus:         ntpStatusMsg,
+		ntpStatus:         ntpMsg,
 		cursorInitialized: false,
 		syncCooldownUntil: time.Now(),
 		termHeight:        0,
+		termWidth:         84,
 	}
 }
 
@@ -231,6 +252,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.WindowSizeMsg:
 		m.termHeight = msg.Height
+		m.termWidth = msg.Width
 		return m, nil
 
 	case tea.KeyMsg:
@@ -417,12 +439,13 @@ func (m model) View() string {
 		return fmt.Sprintf("\n  Error encountered: %v\n\n  Press 'q' to exit.", m.err)
 	}
 
-	var s strings.Builder
-	airStatus := "\033[90m[ OFF AIR ]\033[0m"
-	if isBroadcastActive(m.client) {
-		airStatus = "\033[1;31m[ ON AIR ]\033[0m"
+	width := 84
+	if m.termWidth > 84 {
+		width = m.termWidth
 	}
-	s.WriteString(fmt.Sprintf("\n // NTP TERMINAL MPD PLAYER %s // %s ///////////////////// \n\n", version, airStatus))
+
+	var s strings.Builder
+	s.WriteString(renderHeader(version, isBroadcastActive(m.client), width))
 
 	currentSongIndex := -1
 	if m.currentStatus != nil {
@@ -472,17 +495,78 @@ func (m model) View() string {
 		s.WriteString(fmt.Sprintf("\n  [ Page %d / %d | Shown %d-%d of %d ]\n", currentPage, totalPages, startIdx+1, endIdx, len(m.playlist)))
 	}
 
-	s.WriteString("\n---------------------------------------------------------------\n")
+	s.WriteString("\n" + strings.Repeat("-", width) + "\n")
+
+	// Progress bar for current track
+	if elapsed, err := strconv.ParseFloat(m.currentStatus["elapsed"], 64); err == nil {
+		duration, _ := strconv.ParseFloat(m.currentStatus["duration"], 64)
+		barWidth := width - 22
+		if barWidth < 10 {
+			barWidth = 10
+		}
+		prog := renderProgressBar(elapsed, duration, barWidth)
+		if prog != "" {
+			s.WriteString(fmt.Sprintf("  %s\n", prog))
+		}
+	}
+
 	s.WriteString(fmt.Sprintf("  %s\n", m.ntpStatus))
-	s.WriteString("  [k/j] Move | [Enter] Play | [a] Add | [b/r] On-Air Radio | [d] Del | [o] Audio Reset | [q] Quit\n")
+	s.WriteString("  [k/j] Move | [Enter] Play | [a] Add | [b/r] Radio | [d] Del | [o] Reset | [q] Quit\n")
 
 	return s.String()
 }
 
-func main() {
-	var mockNtpOffset time.Duration = 0 * time.Millisecond
+// queryNTP tries a list of NTP servers and returns the clock offset on first success.
+func queryNTP() (time.Duration, string) {
+	servers := []string{
+		"pool.ntp.org",
+		"time.cloudflare.com",
+		"time.google.com",
+	}
+	for _, srv := range servers {
+		resp, err := ntplib.Query(srv)
+		if err == nil {
+			offset := resp.ClockOffset
+			sign := "+"
+			if offset < 0 {
+				sign = "-"
+				offset = -offset
+			}
+			msg := fmt.Sprintf("NTP (%s): offset %s%dms", srv, sign, offset.Milliseconds())
+			return resp.ClockOffset, msg
+		}
+	}
+	return 0, "NTP: sync failed, using system clock"
+}
 
-	p := tea.NewProgram(initialModel(mockNtpOffset), tea.WithAltScreen())
+// renderProgressBar builds a fixed-width ASCII progress bar.
+func renderProgressBar(elapsed, total float64, width int) string {
+	if total <= 0 {
+		return ""
+	}
+	frac := elapsed / total
+	if frac < 0 {
+		frac = 0
+	}
+	if frac > 1 {
+		frac = 1
+	}
+	filled := int(math.Round(frac * float64(width)))
+	bar := strings.Repeat("#", filled) + strings.Repeat("-", width-filled)
+
+	elSec := int(elapsed)
+	totSec := int(total)
+	return fmt.Sprintf("[%s] %d:%02d / %d:%02d",
+		bar,
+		elSec/60, elSec%60,
+		totSec/60, totSec%60,
+	)
+}
+
+func main() {
+	ntpOffset, ntpMsg := queryNTP()
+
+	p := tea.NewProgram(initialModel(ntpOffset, ntpMsg), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		log.Fatal("Runtime panic within Bubble Tea environment:", err)
 	}
