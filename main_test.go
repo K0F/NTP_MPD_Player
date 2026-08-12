@@ -511,4 +511,25 @@ func TestRenderTrackRow(t *testing.T) {
 			t.Errorf("row should have no duration: %q", got)
 		}
 	})
+
+	t.Run("multi-byte title does not panic and fits width", func(t *testing.T) {
+		track := mpd.Attrs{"title": "Inner⧸Outside-JihB-YbZ_ec — Привет", "duration": "312"}
+		got := strip(renderTrackRow(track, 5, 100, 4, false, 60))
+		if len([]rune(got)) != 60 {
+			t.Errorf("row rune length = %d, want 60: %q", len([]rune(got)), got)
+		}
+	})
+
+	t.Run("narrow width", func(t *testing.T) {
+		track := mpd.Attrs{"title": "A Very Long Track Title Here", "duration": "312"}
+		for _, w := range []int{10, 15} {
+			_ = strip(renderTrackRow(track, 5, 100, 4, false, w)) // must not panic
+		}
+		for _, w := range []int{20, 30} {
+			got := strip(renderTrackRow(track, 5, 100, 4, false, w))
+			if len([]rune(got)) != w {
+				t.Errorf("row rune length = %d, want %d: %q", len([]rune(got)), w, got)
+			}
+		}
+	})
 }

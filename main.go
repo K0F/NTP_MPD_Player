@@ -839,7 +839,8 @@ func trackTitle(track mpd.Attrs) string {
 }
 
 // renderTrackRow lays out one playlist line, keeping the row exactly width
-// characters wide.
+// characters wide. Lengths are measured in runes because truncate cuts on
+// rune boundaries while tracks may contain multi-byte UTF-8.
 func renderTrackRow(track mpd.Attrs, num, total, cursor int, playing bool, width int) string {
 	index := fmt.Sprintf("%*d. ", len(strconv.Itoa(total)), num)
 	marker := " "
@@ -861,7 +862,10 @@ func renderTrackRow(track mpd.Attrs, num, total, cursor int, playing bool, width
 		titleBudget = 1
 	}
 	title := truncate(trackTitle(track), titleBudget-1)
-	pad := width - len(prefix) - len(title) - len(dur)
+	pad := width - len(prefix) - len([]rune(title)) - len(dur)
+	if pad < 0 {
+		pad = 0
+	}
 
 	row := prefix + title + strings.Repeat(" ", pad) + dur
 	switch {
