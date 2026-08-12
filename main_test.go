@@ -2,9 +2,168 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/fhs/gompd/v2/mpd"
 )
+
+func TestParseMusicDir(t *testing.T) {
+	tests := []struct {
+		name   string
+		config string
+		want   string
+	}{
+		{
+			name:   "quoted value with tab separation",
+			config: "music_directory\t\t\"~/Music\"\n",
+			want:   "~/Music",
+		},
+		{
+			name:   "quoted value with spaces",
+			config: "music_directory \t \"/mnt/data/My Music\"\n",
+			want:   "/mnt/data/My Music",
+		},
+		{
+			name:   "unquoted value",
+			config: "music_directory /srv/audio\n",
+			want:   "/srv/audio",
+		},
+		{
+			name: "mixed config with comments",
+			config: "# music_directory is here\n" +
+				"bind_to_address \t\"/tmp/mpd.sock\"\n" +
+				"music_directory\t\t\"/home/me/music\"\n" +
+				"playlist_directory \"/var/lib/mpd/playlists\"\n",
+			want: "/home/me/music",
+		},
+		{
+			name:   "value with trailing comment ignored",
+			config: "music_directory \"/srv/mp3\" # primary store\n",
+			want:   "/srv/mp3",
+		},
+		{
+			name:   "missing returns empty",
+			config: "bind_to_address \"localhost\"\n",
+			want:   "",
+		},
+		{
+			name:   "empty config returns empty",
+			config: "",
+			want:   "",
+		},
+		{
+			name:   "prefix only returns empty",
+			config: "music_directory\n",
+			want:   "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseMusicDir(tt.config)
+			if got != tt.want {
+				t.Errorf("parseMusicDir(%q) = %q, want %q", tt.config, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestExpandPath(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("no home dir: %v", err)
+	}
+
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"~/Music", filepath.Join(home, "Music")},
+		{"~", home},
+		{"/mnt/data/recordings", "/mnt/data/recordings"},
+		{"relative/path", "relative/path"},
+	}
+	for _, tt := range tests {
+		if got := expandPath(tt.in); got != tt.want {
+			t.Errorf("expandPath(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestMPDMusicDirFallsBack(t *testing.T) {
+	// With no config present in the standard locations, must not panic and
+	// return empty so initialModel can apply its own fallback.
+	oldXDG := os.Getenv("XDG_CONFIG_HOME")
+	os.Unsetenv("XDG_CONFIG_HOME")
+	t.Cleanup(func() {
+		if oldXDG != "" {
+			os.Setenv("XDG_CONFIG_HOME", oldXDG)
+		}
+	})
+	got := mpdMusicDir()
+	_ = got // result depends on the machine; just ensure no panic
+}
+
+func TestFindAudioExpr(t *testing.T) {
+	expr := findAudioExpr()
+	for _, ext := range audioExts {
+		if !strings.Contains(expr, "*."+ext) {
+			t.Errorf("audio expr missing extension %q: %q", ext, expr)
+		}
+	}
+	if !strings.Contains(expr, " -o ") {
+		t.Errorf("audio expr should chain with -o: %q", expr)
+	}
+}
+
+// TestAddTrackToPlaylistIntegration exercises the real add path against a live
+// MPD daemon. It is skipped unless MPD_INTEGRATION=1 is set and the daemon is
+// idle (not playing, empty playlist) so the queue is never disturbed.
+func TestAddTrackToPlaylistIntegration(t *testing.T) {
+	if os.Getenv("MPD_INTEGRATION") == "" {
+		t.Skip("set MPD_INTEGRATION=1 to run live MPD integration test")
+	}
+
+	client, err := mpd.Dial("tcp", "localhost:6600")
+	if err != nil {
+		t.Skip("MPD not reachable on localhost:6600:", err)
+	}
+	defer client.Close()
+
+	status, err := client.Status()
+	if err != nil {
+		t.Skip("MPD status failed:", err)
+	}
+	if state := status["state"]; state == "play" || state == "pause" {
+		t.Skip("MPD is playing; not disturbing the queue")
+	}
+	playlist, err := client.PlaylistInfo(-1, -1)
+	if err != nil || len(playlist) > 0 {
+		t.Skip("playlist not empty; not disturbing it")
+	}
+
+	files, err := client.GetFiles()
+	if err != nil || len(files) == 0 {
+		t.Skip("no files in MPD database")
+	}
+
+	defer func() { _ = client.Clear() }()
+
+	track := files[0]
+	if err := addTrackToPlaylist(client, track); err != nil {
+		t.Fatalf("addTrackToPlaylist(%q) failed: %v", track, err)
+	}
+	pl, err := client.PlaylistInfo(-1, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pl) != 1 {
+		t.Fatalf("expected 1 track in playlist, got %d", len(pl))
+	}
+}
 
 func TestRenderHeader(t *testing.T) {
 	t.Run("off air", func(t *testing.T) {

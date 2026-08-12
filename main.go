@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -231,11 +232,50 @@ func fetchPlaylist(client *mpd.Client) tea.Cmd {
 	}
 }
 
+// addTrackToPlaylist adds uri to the playlist. If MPD does not know the file
+// yet, it triggers a database rescan and retries until the file is indexed, so
+// files that just appeared on disk get added. MPD queues update jobs, so we
+// keep retrying rather than relying on job IDs.
+func addTrackToPlaylist(client *mpd.Client, uri string) error {
+	if err := client.Add(uri); err == nil {
+		return nil
+	}
+	if _, err := client.Update(uri); err != nil {
+		return err
+	}
+
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := client.Add(uri); err == nil {
+			return nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return fmt.Errorf("file not indexed after rescan: %s", uri)
+}
+
 // --- FZF Integration ---
+
+// audioExts lists the file extensions MPD is expected to index.
+var audioExts = []string{
+	"mp3", "flac", "wav", "opus", "ogg", "oga",
+	"m4a", "m4b", "aac", "mp4", "webm", "mka",
+	"wma", "aiff", "aif", "ape", "wv", "dsf", "dff", "alac",
+}
+
+// findAudioExpr builds a find expression matching audio file extensions.
+func findAudioExpr() string {
+	parts := make([]string, 0, len(audioExts))
+	for _, ext := range audioExts {
+		parts = append(parts, "-iname '*."+ext+"'")
+	}
+	return strings.Join(parts, " -o ")
+}
+
 func runFzf(musicDir string) tea.Cmd {
 	return tea.ExecProcess(exec.Command("sh", "-c", fmt.Sprintf(
-		"cd %s && find . -type f -not -path '*/.*' | fzf -m > $HOME/observatory_fzf.txt",
-		musicDir,
+		"cd %q && find . -type f \\( %s \\) -not -path '*/.*' | fzf -m > $HOME/observatory_fzf.txt",
+		musicDir, findAudioExpr(),
 	)), func(err error) tea.Msg {
 		if err != nil {
 			homeDir := os.Getenv("HOME")
@@ -265,6 +305,71 @@ func runFzf(musicDir string) tea.Cmd {
 	})
 }
 
+// --- MPD Config Parsing ---
+
+// expandPath expands a leading ~ to the user's home directory.
+func expandPath(path string) string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = os.Getenv("HOME")
+	}
+	if path == "~" {
+		return home
+	}
+	if strings.HasPrefix(path, "~/") {
+		return filepath.Join(home, path[2:])
+	}
+	return path
+}
+
+// parseMusicDir extracts the music_directory value from MPD config content.
+func parseMusicDir(config string) string {
+	for _, line := range strings.Split(config, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if !strings.HasPrefix(line, "music_directory") {
+			continue
+		}
+		rest := strings.TrimSpace(line[len("music_directory"):])
+		if rest == "" {
+			continue
+		}
+		if strings.HasPrefix(rest, `"`) {
+			if end := strings.Index(rest[1:], `"`); end != -1 {
+				return rest[1 : 1+end]
+			}
+		}
+		return rest
+	}
+	return ""
+}
+
+// mpdMusicDir locates the MPD config file and returns the music_directory path.
+func mpdMusicDir() string {
+	home, _ := os.UserHomeDir()
+	var configPaths []string
+	if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
+		configPaths = append(configPaths, filepath.Join(xdg, "mpd", "mpd.conf"))
+	}
+	if home != "" {
+		configPaths = append(configPaths, filepath.Join(home, ".config", "mpd", "mpd.conf"))
+	}
+	configPaths = append(configPaths, "/etc/mpd.conf")
+
+	for _, path := range configPaths {
+		content, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		if dir := parseMusicDir(string(content)); dir != "" {
+			return expandPath(dir)
+		}
+	}
+	return ""
+}
+
 // --- Model Initialization ---
 func initialModel(ntpOffset time.Duration, ntpMsg string) model {
 	c, err := mpd.Dial("tcp", "localhost:6600")
@@ -272,13 +377,20 @@ func initialModel(ntpOffset time.Duration, ntpMsg string) model {
 		log.Fatal("Could not connect to MPD local daemon:", err)
 	}
 
-	musicPath := "/mnt/data/recordings"
+	musicPath := mpdMusicDir()
 	var hardwareLatency time.Duration = 0 * time.Millisecond
 
 	if os.Getenv("TERMUX_VERSION") != "" {
 		hardwareLatency = 450 * time.Millisecond
 		ntpMsg = "NTP + Android Hardware Audio Profile Active (+0.450s)"
-		musicPath = os.Getenv("HOME") + "/storage/music"
+		if musicPath == "" {
+			musicPath = os.Getenv("HOME") + "/storage/music"
+		}
+	}
+
+	if musicPath == "" {
+		musicPath = "~/Music"
+		musicPath = expandPath(musicPath)
 	}
 
 	return model{
@@ -396,12 +508,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case fzfResultMsg:
 		if len(msg) > 0 {
 			ensureOutputsEnabled(m.client)
+			var failed []string
 			for _, track := range msg {
-				err := m.client.Add(track)
-				if err != nil {
-					_, _ = m.client.Update(track)
-					_ = m.client.Add(track)
+				if err := addTrackToPlaylist(m.client, track); err != nil {
+					failed = append(failed, track)
 				}
+			}
+			if len(failed) > 0 {
+				m.ntpStatus = fmt.Sprintf("Add failed (%d): %s", len(failed), strings.Join(failed, ", "))
+			} else {
+				m.ntpStatus = fmt.Sprintf("Added %d track(s)", len(msg))
 			}
 			_ = os.Remove(os.Getenv("HOME") + "/observatory_fzf.txt")
 			return m, fetchPlaylist(m.client)

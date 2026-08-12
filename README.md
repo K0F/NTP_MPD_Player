@@ -17,8 +17,9 @@ pushing.
 - **Termux / Android support** — auto-detects Termux, switches the music
   directory to `~/storage/music` and applies a 450 ms hardware-audio latency
   profile.
-- **FZF track search** — launch `fzf` over the music directory and add multiple
-  tracks to the playlist in one go.
+- **FZF track search** — launch `fzf` over the music directory (filtered to
+  audio files) and add multiple tracks to the playlist in one go. If a file
+  isn't in MPD's database yet, it is rescanned and added automatically.
 - **Playlist management** — play, move, delete individual tracks, or clear the
   whole queue.
 - **Paginated playlist view** — page-by-page track list that follows the cursor,
@@ -75,7 +76,12 @@ Icecast connection details are hard-coded at the top of `main.go`:
 | User      | `source`         |
 | Password  | `ICECAST_PASSWORD` env var |
 | MPD host  | `localhost:6600` |
-| Music dir | `/mnt/data/recordings` (Linux) / `~/storage/music` (Termux) |
+| Music dir | read from `music_directory` in MPD config |
+
+The music directory is read from the MPD config file (`music_directory`), not
+hard-coded. Config is located via `$XDG_CONFIG_HOME/mpd/mpd.conf`,
+`~/.config/mpd/mpd.conf` or `/etc/mpd.conf`, with `~/` expanded. Falls back to
+`~/Music`, or `~/storage/music` on Termux, if MPD config is unavailable.
 
 The Icecast source password is read from the `ICECAST_PASSWORD` environment
 variable and is never stored in the source tree. Set it before running, e.g.:
