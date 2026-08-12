@@ -167,7 +167,7 @@ func TestAddTrackToPlaylistIntegration(t *testing.T) {
 
 func TestRenderHeader(t *testing.T) {
 	t.Run("off air", func(t *testing.T) {
-		got := renderHeader("0.2", false, 84)
+		got := renderHeader("0.2", false, -1, 84)
 		wantPrefix := "\n // NTP TERMINAL MPD PLAYER v0.2 "
 		if !strings.HasPrefix(got, wantPrefix) {
 			t.Errorf("header = %q, want prefix %q", got, wantPrefix)
@@ -180,13 +180,20 @@ func TestRenderHeader(t *testing.T) {
 		}
 	})
 
-	t.Run("on air", func(t *testing.T) {
-		got := renderHeader("0.2", true, 84)
-		if !strings.Contains(got, "\033[1;31m[ ON AIR ]\033[0m") {
-			t.Errorf("on-air status not red/bold: %q", got)
+	t.Run("on air shows listeners", func(t *testing.T) {
+		got := renderHeader("0.2", true, 5, 84)
+		if !strings.Contains(got, "\033[1;31m[ ON AIR: 5 ]\033[0m") {
+			t.Errorf("on-air status missing listener count: %q", got)
 		}
-		if !strings.Contains(got, "[ ON AIR ]") {
-			t.Errorf("header missing ON AIR status: %q", got)
+		if !strings.Contains(got, "[ ON AIR: 5 ]") {
+			t.Errorf("header missing ON AIR: 5 status: %q", got)
+		}
+	})
+
+	t.Run("on air unknown listeners", func(t *testing.T) {
+		got := renderHeader("0.2", true, -1, 84)
+		if !strings.Contains(got, "[ ON AIR: ? ]") {
+			t.Errorf("header should show unknown listener count: %q", got)
 		}
 	})
 
@@ -205,7 +212,7 @@ func TestRenderHeader(t *testing.T) {
 				s = s[:start] + s[start+end+1:]
 			}
 		}
-		got := strip(renderHeader("0.2", false, 100))
+		got := strip(renderHeader("0.2", false, -1, 100))
 		line := strings.TrimPrefix(got, "\n")
 		line = strings.TrimSuffix(line, "\n")
 		first, _, _ := strings.Cut(line, "\n")
@@ -215,7 +222,7 @@ func TestRenderHeader(t *testing.T) {
 	})
 
 	t.Run("minimum fill width", func(t *testing.T) {
-		got := renderHeader("0.2", false, 10)
+		got := renderHeader("0.2", false, -1, 10)
 		if !strings.HasPrefix(got, "\n // ") {
 			t.Errorf("narrow header malformed: %q", got)
 		}
@@ -320,16 +327,188 @@ func TestRenderProgressBar(t *testing.T) {
 }
 
 func TestRenderHeaderAndBarFormat(t *testing.T) {
-	header := renderHeader("1.0", true, 80)
+	header := renderHeader("1.0", true, 3, 80)
 	bar := renderProgressBar(30, 120, 20)
 	combined := fmt.Sprintf("%s%s", header, bar)
 	if combined == "" {
 		t.Fatal("expected non-empty output")
 	}
-	if !strings.Contains(header, "ON AIR") {
-		t.Errorf("header should advertise ON AIR: %q", header)
+	if !strings.Contains(header, "ON AIR: 3") {
+		t.Errorf("header should advertise ON AIR with listeners: %q", header)
 	}
 	if !strings.Contains(bar, "] 0:30 / 2:00") {
 		t.Errorf("bar should show 0:30 / 2:00: %q", bar)
 	}
+}
+
+func TestParseIcecastListeners(t *testing.T) {
+	const mount = "/radio.mp3"
+	tests := []struct {
+		name string
+		body string
+		want int
+	}{
+		{
+			name: "single source object",
+			body: `{"icestats":{"source":{"listeners":3,"listenurl":"http://x:9000/radio.mp3"}}}`,
+			want: 3,
+		},
+		{
+			name: "source array picks matching mount",
+			body: `{"icestats":{"source":[
+				{"listeners":1,"listenurl":"http://x:9000/other"},
+				{"listeners":7,"listenurl":"http://x:9000/radio.mp3"}]}}`,
+			want: 7,
+		},
+		{
+			name: "source array falls back to first",
+			body: `{"icestats":{"source":[
+				{"listeners":2,"listenurl":"http://x:9000/one"},
+				{"listeners":4,"listenurl":"http://x:9000/two"}]}}`,
+			want: 2,
+		},
+		{
+			name: "no source",
+			body: `{"icestats":{"host":"x"}}`,
+			want: 0,
+		},
+		{
+			name: "empty source array",
+			body: `{"icestats":{"source":[]}}`,
+			want: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseIcecastListeners([]byte(tt.body), mount)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("parseIcecastListeners() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+
+	t.Run("malformed json errors", func(t *testing.T) {
+		if _, err := parseIcecastListeners([]byte("{nope"), mount); err == nil {
+			t.Error("expected error for malformed JSON")
+		}
+	})
+}
+
+func TestTruncate(t *testing.T) {
+	tests := []struct {
+		in   string
+		max  int
+		want string
+	}{
+		{"short", 20, "short"},
+		{"hello", 5, "hello"},
+		{"hello", 3, "he~"},
+		{"hello", 1, "h"},
+		{"hello", 0, ""},
+		{"héllo", 4, "hél~"},
+		{"", 5, ""},
+	}
+	for _, tt := range tests {
+		if got := truncate(tt.in, tt.max); got != tt.want {
+			t.Errorf("truncate(%q, %d) = %q, want %q", tt.in, tt.max, got, tt.want)
+		}
+	}
+}
+
+func TestFormatDur(t *testing.T) {
+	tests := []struct {
+		sec  float64
+		want string
+	}{
+		{0, "0:00"},
+		{65, "1:05"},
+		{59.9, "0:59"},
+		{3600, "1:00:00"},
+		{3725, "1:02:05"},
+		{-10, "0:00"},
+	}
+	for _, tt := range tests {
+		if got := formatDur(tt.sec); got != tt.want {
+			t.Errorf("formatDur(%v) = %q, want %q", tt.sec, got, tt.want)
+		}
+	}
+}
+
+func TestFormatOffset(t *testing.T) {
+	if got := formatOffset(12 * 1000 * 1000); got != "+12ms" {
+		t.Errorf("formatOffset(+12ms) = %q", got)
+	}
+	if got := formatOffset(-5 * 1000 * 1000); got != "-5ms" {
+		t.Errorf("formatOffset(-5ms) = %q", got)
+	}
+	if got := formatOffset(0); got != "+0ms" {
+		t.Errorf("formatOffset(0) = %q", got)
+	}
+}
+
+func TestTrackTitle(t *testing.T) {
+	if got := trackTitle(mpd.Attrs{"artist": "A", "title": "T"}); got != "A - T" {
+		t.Errorf("trackTitle() = %q", got)
+	}
+	if got := trackTitle(mpd.Attrs{"title": "Only"}); got != "Only" {
+		t.Errorf("trackTitle() = %q", got)
+	}
+	if got := trackTitle(mpd.Attrs{"file": "dir/file.mp3"}); got != "file.mp3" {
+		t.Errorf("trackTitle() = %q", got)
+	}
+}
+
+func TestRenderTrackRow(t *testing.T) {
+	strip := func(s string) string {
+		for {
+			start := strings.Index(s, "\033[")
+			if start == -1 {
+				return s
+			}
+			end := strings.Index(s[start:], "m")
+			if end == -1 {
+				return s
+			}
+			s = s[:start] + s[start+end+1:]
+		}
+	}
+
+	t.Run("fits width exactly", func(t *testing.T) {
+		track := mpd.Attrs{"title": "Some Long Title", "duration": "312"}
+		got := strip(renderTrackRow(track, 4, 100, 3, false, 60))
+		if len(got) != 60 {
+			t.Errorf("row length = %d, want 60: %q", len(got), got)
+		}
+		if !strings.Contains(got, "[5:12]") {
+			t.Errorf("row missing duration: %q", got)
+		}
+	})
+
+	t.Run("cursor marker", func(t *testing.T) {
+		track := mpd.Attrs{"title": "T"}
+		got := renderTrackRow(track, 1, 1, 0, false, 40)
+		if !strings.HasPrefix(got, "\033[7m > 1. ") {
+			t.Errorf("cursor row should be reversed and marked: %q", got)
+		}
+	})
+
+	t.Run("playing marker", func(t *testing.T) {
+		track := mpd.Attrs{"title": "T"}
+		got := renderTrackRow(track, 2, 2, 0, true, 40)
+		if !strings.HasPrefix(got, "\033[32m   2. * ") {
+			t.Errorf("playing row should be green with star: %q", got)
+		}
+	})
+
+	t.Run("no duration", func(t *testing.T) {
+		track := mpd.Attrs{"title": "T"}
+		got := strip(renderTrackRow(track, 1, 1, 0, false, 30))
+		if strings.Contains(got, "[") {
+			t.Errorf("row should have no duration: %q", got)
+		}
+	})
 }

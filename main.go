@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"net"
@@ -19,14 +21,15 @@ import (
 	"github.com/fhs/gompd/v2/mpd"
 )
 
-var version string = "0.2"
+var version string = "0.3"
 
 // --- Message Types ---
 type (
-	statusMsg    mpd.Attrs
-	playlistMsg  []mpd.Attrs
-	fzfResultMsg []string
-	errMsg       error
+	statusMsg       mpd.Attrs
+	playlistMsg     []mpd.Attrs
+	fzfResultMsg    []string
+	icecastStatsMsg int
+	errMsg          error
 )
 
 // --- Application Model ---
@@ -44,13 +47,15 @@ type model struct {
 	syncCooldownUntil time.Time
 	termHeight        int
 	termWidth         int
+	showHelp          bool
+	listeners         int
+	volume            int
 }
 
 // --- Icecast Metadata Push ---
 
-// icecastCfg holds the connection details for the Icecast source.
-// The password is read from the ICECAST_PASSWORD environment variable so it
-// never has to live in the source tree.
+// The Icecast source password comes from the environment so it never has to
+// live in the source tree.
 var icecastCfg = struct {
 	host     string
 	port     string
@@ -65,8 +70,6 @@ var icecastCfg = struct {
 	user:     "source",
 }
 
-// pushIcecastMeta sends the current track title to the Icecast admin metadata endpoint.
-// It runs in a goroutine so it never blocks the TUI.
 func pushIcecastMeta(artist, title string) {
 	go func() {
 		song := title
@@ -96,6 +99,74 @@ func pushIcecastMeta(artist, title string) {
 	}()
 }
 
+// parseIcecastListeners extracts the listener count for mount from the
+// status-json.xsl response. source may be a single object or an array.
+func parseIcecastListeners(body []byte, mount string) (int, error) {
+	var resp struct {
+		Ices struct {
+			Source json.RawMessage `json:"source"`
+		} `json:"icestats"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return 0, err
+	}
+	if len(resp.Ices.Source) == 0 {
+		return 0, nil
+	}
+
+	type source struct {
+		Listeners int    `json:"listeners"`
+		ListenURL string `json:"listenurl"`
+	}
+
+	var sources []source
+	if resp.Ices.Source[0] == '[' {
+		if err := json.Unmarshal(resp.Ices.Source, &sources); err != nil {
+			return 0, err
+		}
+	} else {
+		var single source
+		if err := json.Unmarshal(resp.Ices.Source, &single); err != nil {
+			return 0, err
+		}
+		sources = []source{single}
+	}
+
+	if len(sources) == 0 {
+		return 0, nil
+	}
+	for _, s := range sources {
+		if mount != "" && strings.Contains(s.ListenURL, mount) {
+			return s.Listeners, nil
+		}
+	}
+	return sources[0].Listeners, nil
+}
+
+// pollIcecastListeners returns the current radio listener count, or -1 when the
+// stats endpoint is unreachable.
+func pollIcecastListeners() tea.Cmd {
+	return func() tea.Msg {
+		time.Sleep(10 * time.Second)
+		endpoint := fmt.Sprintf("http://%s:%s/status-json.xsl", icecastCfg.host, icecastCfg.port)
+		client := &http.Client{Timeout: 3 * time.Second}
+		resp, err := client.Get(endpoint)
+		if err != nil {
+			return icecastStatsMsg(-1)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return icecastStatsMsg(-1)
+		}
+		count, err := parseIcecastListeners(body, icecastCfg.mount)
+		if err != nil {
+			return icecastStatsMsg(-1)
+		}
+		return icecastStatsMsg(count)
+	}
+}
+
 // --- Audio Control Helpers ---
 func preciseSeekRaw(targetSec float64) {
 	conn, err := net.Dial("tcp", "localhost:6600")
@@ -111,6 +182,19 @@ func preciseSeekRaw(targetSec float64) {
 
 	cmd := fmt.Sprintf("seekcur %.3f\n", targetSec)
 	_, _ = conn.Write([]byte(cmd))
+}
+
+// wallClockTargetSec computes the track position that aligns playback with the
+// wall clock (second-of-minute), wrapping around the track duration. Returns
+// false when no playable duration is known.
+func wallClockTargetSec(clockOffset time.Duration, duration string) (float64, bool) {
+	total, err := strconv.ParseFloat(duration, 64)
+	if err != nil || total <= 0 {
+		return 0, false
+	}
+	trueTime := time.Now().Add(clockOffset)
+	targetSec := float64(trueTime.Second()) + float64(trueTime.Nanosecond())/1e9
+	return math.Mod(targetSec, total), true
 }
 
 func ensureOutputsEnabled(client *mpd.Client) {
@@ -191,13 +275,17 @@ func isBroadcastActive(client *mpd.Client) bool {
 	return false
 }
 
-func renderHeader(version string, onAir bool, width int) string {
+func renderHeader(version string, onAir bool, listeners int, width int) string {
 	left := fmt.Sprintf(" // NTP TERMINAL MPD PLAYER v%s ", version)
 	statusText := "[ OFF AIR ]"
 	statusFormatted := "\033[90m[ OFF AIR ]\033[0m"
 	if onAir {
-		statusText = "[ ON AIR ]"
-		statusFormatted = "\033[1;31m[ ON AIR ]\033[0m"
+		if listeners >= 0 {
+			statusText = fmt.Sprintf("[ ON AIR: %d ]", listeners)
+		} else {
+			statusText = "[ ON AIR: ? ]"
+		}
+		statusFormatted = "\033[1;31m" + statusText + "\033[0m"
 	}
 	rightLen := len(statusText) + 4 // trailing " %s //" after fill
 
@@ -256,14 +344,12 @@ func addTrackToPlaylist(client *mpd.Client, uri string) error {
 
 // --- FZF Integration ---
 
-// audioExts lists the file extensions MPD is expected to index.
 var audioExts = []string{
 	"mp3", "flac", "wav", "opus", "ogg", "oga",
 	"m4a", "m4b", "aac", "mp4", "webm", "mka",
 	"wma", "aiff", "aif", "ape", "wv", "dsf", "dff", "alac",
 }
 
-// findAudioExpr builds a find expression matching audio file extensions.
 func findAudioExpr() string {
 	parts := make([]string, 0, len(audioExts))
 	for _, ext := range audioExts {
@@ -307,7 +393,6 @@ func runFzf(musicDir string) tea.Cmd {
 
 // --- MPD Config Parsing ---
 
-// expandPath expands a leading ~ to the user's home directory.
 func expandPath(path string) string {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -322,7 +407,6 @@ func expandPath(path string) string {
 	return path
 }
 
-// parseMusicDir extracts the music_directory value from MPD config content.
 func parseMusicDir(config string) string {
 	for _, line := range strings.Split(config, "\n") {
 		line = strings.TrimSpace(line)
@@ -346,7 +430,6 @@ func parseMusicDir(config string) string {
 	return ""
 }
 
-// mpdMusicDir locates the MPD config file and returns the music_directory path.
 func mpdMusicDir() string {
 	home, _ := os.UserHomeDir()
 	var configPaths []string
@@ -403,11 +486,14 @@ func initialModel(ntpOffset time.Duration, ntpMsg string) model {
 		syncCooldownUntil: time.Now(),
 		termHeight:        0,
 		termWidth:         84,
+		showHelp:          false,
+		listeners:         -1,
+		volume:            -1,
 	}
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(fetchPlaylist(m.client), syncEngine(m.client))
+	return tea.Batch(fetchPlaylist(m.client), syncEngine(m.client), pollIcecastListeners())
 }
 
 // --- State Update Loop ---
@@ -434,11 +520,88 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "enter":
-			if len(m.playlist) > 0 && m.cursor < len(m.playlist) {
-				ensureOutputsEnabled(m.client)
-				_ = m.client.Play(m.cursor)
-				m.syncCooldownUntil = time.Now().Add(2500 * time.Millisecond)
+			ensureOutputsEnabled(m.client)
+			st, err := m.client.Status()
+			if err != nil {
+				m.ntpStatus = fmt.Sprintf("Status error: %v", err)
+				return m, nil
 			}
+			switch st["state"] {
+			case "play":
+				_ = m.client.Pause(true)
+				m.ntpStatus = "Paused"
+			case "pause":
+				_ = m.client.Pause(false)
+				m.syncCooldownUntil = time.Now().Add(2500 * time.Millisecond)
+				m.ntpStatus = "Resumed"
+			default:
+				if len(m.playlist) > 0 && m.cursor < len(m.playlist) {
+					_ = m.client.Play(m.cursor)
+					m.syncCooldownUntil = time.Now().Add(2500 * time.Millisecond)
+					m.ntpStatus = "Playing"
+				}
+			}
+			return m, nil
+
+		case "n":
+			ensureOutputsEnabled(m.client)
+			if err := m.client.Next(); err != nil {
+				m.ntpStatus = fmt.Sprintf("Next error: %v", err)
+			} else {
+				m.syncCooldownUntil = time.Now().Add(2500 * time.Millisecond)
+				m.ntpStatus = "Next track"
+			}
+			return m, nil
+
+		case "s":
+			ensureOutputsEnabled(m.client)
+			if targetSec, ok := wallClockTargetSec(m.clockOffset, m.currentStatus["duration"]); ok {
+				preciseSeekRaw(targetSec)
+				m.syncCooldownUntil = time.Now().Add(2500 * time.Millisecond)
+				m.ntpStatus = "Forced wall-clock sync"
+			} else {
+				m.ntpStatus = "Sync: no track playing"
+			}
+			return m, nil
+
+		case "x":
+			_ = m.client.Stop()
+			m.ntpStatus = "Stopped"
+			return m, nil
+
+		case "[":
+			if m.volume < 0 {
+				if st, err := m.client.Status(); err == nil {
+					m.volume, _ = strconv.Atoi(st["volume"])
+				}
+			}
+			vol := m.volume - 5
+			if vol < 0 {
+				vol = 0
+			}
+			_ = m.client.SetVolume(vol)
+			m.volume = vol
+			m.ntpStatus = fmt.Sprintf("Volume %d%%", vol)
+			return m, nil
+
+		case "]":
+			if m.volume < 0 {
+				if st, err := m.client.Status(); err == nil {
+					m.volume, _ = strconv.Atoi(st["volume"])
+				}
+			}
+			vol := m.volume + 5
+			if vol > 100 {
+				vol = 100
+			}
+			_ = m.client.SetVolume(vol)
+			m.volume = vol
+			m.ntpStatus = fmt.Sprintf("Volume %d%%", vol)
+			return m, nil
+
+		case "?":
+			m.showHelp = !m.showHelp
+			return m, nil
 
 		case "o":
 			ensureOutputsEnabled(m.client)
@@ -525,6 +688,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case statusMsg:
 		m.currentStatus = mpd.Attrs(msg)
+		if v, err := strconv.Atoi(m.currentStatus["volume"]); err == nil {
+			m.volume = v
+		}
 		if errStr, ok := m.currentStatus["error"]; ok && errStr != "" {
 			ensureOutputsEnabled(m.client)
 		}
@@ -547,7 +713,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if currentSongID != "" && currentSongID != m.lastSongID && m.playlist != nil {
 			m.lastSongID = currentSongID
 
-			// Push track metadata to Icecast when song changes
 			if songPos >= 0 && songPos < len(m.playlist) {
 				track := m.playlist[songPos]
 				artist := track["artist"]
@@ -605,6 +770,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		return m, syncEngine(m.client)
 
+	case icecastStatsMsg:
+		m.listeners = int(msg)
+		return m, pollIcecastListeners()
+
 	case errMsg:
 		m.err = msg
 		return m, nil
@@ -614,6 +783,173 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 // --- View Renderer ---
+
+func truncate(s string, max int) string {
+	if max < 0 {
+		max = 0
+	}
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	if max <= 1 {
+		if max == 0 {
+			return ""
+		}
+		return string(r[:1])
+	}
+	return string(r[:max-1]) + "~"
+}
+
+func formatDur(sec float64) string {
+	if sec < 0 {
+		sec = 0
+	}
+	total := int(sec)
+	h, m, s := total/3600, (total%3600)/60, total%60
+	if h > 0 {
+		return fmt.Sprintf("%d:%02d:%02d", h, m, s)
+	}
+	return fmt.Sprintf("%d:%02d", m, s)
+}
+
+func wallClock(offset time.Duration) string {
+	return time.Now().Add(offset).Format("15:04:05")
+}
+
+func formatOffset(d time.Duration) string {
+	ms := d.Milliseconds()
+	sign := "+"
+	if ms < 0 {
+		sign = "-"
+		ms = -ms
+	}
+	return fmt.Sprintf("%s%dms", sign, ms)
+}
+
+func trackTitle(track mpd.Attrs) string {
+	if title := track["title"]; title != "" {
+		if artist := track["artist"]; artist != "" {
+			return artist + " - " + title
+		}
+		return title
+	}
+	parts := strings.Split(track["file"], "/")
+	return parts[len(parts)-1]
+}
+
+// renderTrackRow lays out one playlist line, keeping the row exactly width
+// characters wide.
+func renderTrackRow(track mpd.Attrs, num, total, cursor int, playing bool, width int) string {
+	index := fmt.Sprintf("%*d. ", len(strconv.Itoa(total)), num)
+	marker := " "
+	if playing {
+		marker = "*"
+	}
+	prefix := "   " + index + marker + " "
+	if num-1 == cursor {
+		prefix = " > " + index + marker + " "
+	}
+
+	dur := ""
+	if d, err := strconv.ParseFloat(track["duration"], 64); err == nil && d > 0 {
+		dur = "[" + formatDur(d) + "]"
+	}
+
+	titleBudget := width - len(prefix) - len(dur)
+	if titleBudget < 1 {
+		titleBudget = 1
+	}
+	title := truncate(trackTitle(track), titleBudget-1)
+	pad := width - len(prefix) - len(title) - len(dur)
+
+	row := prefix + title + strings.Repeat(" ", pad) + dur
+	switch {
+	case playing && num-1 == cursor:
+		return "\033[32m\033[7m" + row + "\033[0m"
+	case playing:
+		return "\033[32m" + row + "\033[0m"
+	case num-1 == cursor:
+		return "\033[7m" + row + "\033[0m"
+	default:
+		return row
+	}
+}
+
+func renderNowPlaying(m model, width int) string {
+	var s strings.Builder
+	state := m.currentStatus["state"]
+	stateLabel, stateColor := "[ STOP ]", "\033[90m"
+	switch state {
+	case "play":
+		stateLabel, stateColor = "[ PLAY ]", "\033[32m"
+	case "pause":
+		stateLabel, stateColor = "[ PAUSE ]", "\033[33m"
+	}
+
+	title, artist, album := "", "", ""
+	if pos, err := strconv.Atoi(m.currentStatus["song"]); err == nil && pos >= 0 && pos < len(m.playlist) {
+		t := m.playlist[pos]
+		artist, title, album = t["artist"], t["title"], t["album"]
+	}
+	if title == "" {
+		title = "(no track selected)"
+	}
+
+	line1 := stateColor + stateLabel + "\033[0m  " + truncate(title, width-len(stateLabel)-2)
+	s.WriteString(line1 + "\n")
+
+	if meta := strings.TrimSpace(artist + "  " + album); meta != "" {
+		s.WriteString("  " + truncate(meta, width-2) + "\n")
+	}
+
+	if elapsed, err := strconv.ParseFloat(m.currentStatus["elapsed"], 64); err == nil {
+		duration, _ := strconv.ParseFloat(m.currentStatus["duration"], 64)
+		barWidth := width - 28
+		if barWidth < 10 {
+			barWidth = 10
+		}
+		if prog := renderProgressBar(elapsed, duration, barWidth); prog != "" {
+			frac := 0.0
+			if duration > 0 {
+				frac = elapsed / duration
+				if frac < 0 {
+					frac = 0
+				}
+				if frac > 1 {
+					frac = 1
+				}
+			}
+			s.WriteString("  " + prog + fmt.Sprintf("  (%d%%)\n", int(frac*100)))
+		}
+	}
+	return s.String()
+}
+
+func renderHelp(width int) string {
+	rows := []struct{ key, desc string }{
+		{"k/j, up/down", "move cursor"},
+		{"enter", "play / pause toggle"},
+		{"n", "next track"},
+		{"s", "sync to wall clock"},
+		{"x", "stop"},
+		{"[ / ]", "volume down / up"},
+		{"+ / -", "tune clock offset"},
+		{"a", "add tracks via FZF"},
+		{"d / delete", "delete track / clear queue"},
+		{"pgup / pgdown", "move track in queue"},
+		{"b / r", "toggle On Air radio"},
+		{"o", "re-enable audio outputs"},
+		{"? / q", "toggle help / quit"},
+	}
+	var s strings.Builder
+	s.WriteString("\n  KEYBINDINGS\n  " + strings.Repeat("-", width-2) + "\n")
+	for _, r := range rows {
+		s.WriteString(fmt.Sprintf("  %-22s %s\n", r.key, r.desc))
+	}
+	return s.String()
+}
+
 func (m model) View() string {
 	if m.err != nil {
 		return fmt.Sprintf("\n  Error encountered: %v\n\n  Press 'q' to exit.", m.err)
@@ -624,22 +960,21 @@ func (m model) View() string {
 		width = m.termWidth
 	}
 
+	onAir := isBroadcastActive(m.client)
+
 	var s strings.Builder
-	s.WriteString(renderHeader(version, isBroadcastActive(m.client), width))
+	s.WriteString(renderHeader(version, onAir, m.listeners, width))
+	s.WriteString(renderNowPlaying(m, width))
+	s.WriteString(strings.Repeat("-", width) + "\n")
 
-	currentSongIndex := -1
-	if m.currentStatus != nil {
-		if idx, err := strconv.Atoi(m.currentStatus["song"]); err == nil && m.currentStatus["state"] == "play" {
-			currentSongIndex = idx
-		}
-	}
-
-	if len(m.playlist) == 0 {
+	if m.showHelp {
+		s.WriteString(renderHelp(width))
+	} else if len(m.playlist) == 0 {
 		s.WriteString("   (No tracks loaded. Press [a] to add music via FZF)\n")
 	} else {
-		pageSize := 10
-		if m.termHeight > 9 {
-			pageSize = m.termHeight - 9
+		pageSize := m.termHeight - strings.Count(s.String(), "\n") - 4
+		if pageSize < 5 {
+			pageSize = 5
 		}
 
 		startIdx := (m.cursor / pageSize) * pageSize
@@ -648,55 +983,40 @@ func (m model) View() string {
 			endIdx = len(m.playlist)
 		}
 
-		totalPages := int(math.Ceil(float64(len(m.playlist)) / float64(pageSize)))
-		currentPage := (startIdx / pageSize) + 1
-
-		for i := startIdx; i < endIdx; i++ {
-			track := m.playlist[i]
-			cursorStr := "  "
-			if i == m.cursor {
-				cursorStr = " > "
-			}
-
-			title := track["title"]
-			if title == "" {
-				file := track["file"]
-				parts := strings.Split(file, "/")
-				title = parts[len(parts)-1]
-			}
-
-			if i == currentSongIndex {
-				s.WriteString(fmt.Sprintf("%s\033[32m%d. %s\033[0m\n", cursorStr, i+1, title))
-			} else {
-				s.WriteString(fmt.Sprintf("%s%d. %s\n", cursorStr, i+1, title))
-			}
+		currentSongPos := -1
+		if pos, err := strconv.Atoi(m.currentStatus["song"]); err == nil && m.currentStatus["state"] == "play" {
+			currentSongPos = pos
 		}
 
+		for i := startIdx; i < endIdx; i++ {
+			s.WriteString(renderTrackRow(m.playlist[i], i+1, len(m.playlist), m.cursor, i == currentSongPos, width) + "\n")
+		}
+
+		totalPages := int(math.Ceil(float64(len(m.playlist)) / float64(pageSize)))
+		currentPage := (startIdx / pageSize) + 1
 		s.WriteString(fmt.Sprintf("\n  [ Page %d / %d | Shown %d-%d of %d ]\n", currentPage, totalPages, startIdx+1, endIdx, len(m.playlist)))
 	}
 
-	s.WriteString("\n" + strings.Repeat("-", width) + "\n")
-
-	// Progress bar for current track
-	if elapsed, err := strconv.ParseFloat(m.currentStatus["elapsed"], 64); err == nil {
-		duration, _ := strconv.ParseFloat(m.currentStatus["duration"], 64)
-		barWidth := width - 22
-		if barWidth < 10 {
-			barWidth = 10
-		}
-		prog := renderProgressBar(elapsed, duration, barWidth)
-		if prog != "" {
-			s.WriteString(fmt.Sprintf("  %s\n", prog))
-		}
+	listenerTxt := "?"
+	if m.listeners >= 0 {
+		listenerTxt = strconv.Itoa(m.listeners)
+	}
+	info := []string{
+		"Clock " + wallClock(m.clockOffset),
+		"Offset " + formatOffset(m.clockOffset),
+		fmt.Sprintf("Listeners %s", listenerTxt),
+	}
+	if m.volume >= 0 {
+		info = append([]string{fmt.Sprintf("Vol %d%%", m.volume)}, info...)
 	}
 
-	s.WriteString(fmt.Sprintf("  %s\n", m.ntpStatus))
-	s.WriteString("  [k/j] Move | [Enter] Play | [a] Add | [b/r] Radio | [d] Del | [o] Reset | [q] Quit\n")
+	s.WriteString("\n  " + m.ntpStatus + "\n")
+	s.WriteString("  " + strings.Join(info, " | ") + "\n")
+	s.WriteString("  [k/j] Move | [Enter] Play/Pause | [n] Next | [s] Sync | [a] Add | [b/r] Radio | [x] Stop | [?] Help | [q] Quit\n")
 
 	return s.String()
 }
 
-// queryNTP tries a list of NTP servers and returns the clock offset on first success.
 func queryNTP() (time.Duration, string) {
 	servers := []string{
 		"pool.ntp.org",
@@ -719,7 +1039,6 @@ func queryNTP() (time.Duration, string) {
 	return 0, "NTP: sync failed, using system clock"
 }
 
-// renderProgressBar builds a fixed-width ASCII progress bar.
 func renderProgressBar(elapsed, total float64, width int) string {
 	if total <= 0 {
 		return ""

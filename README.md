@@ -1,8 +1,8 @@
 # NTP Terminal MPD Player
 
 A terminal UI (TUI) MPD client that keeps playback locked to the wall clock
-via real NTP sync, with optional Icecast radio broadcasting and track metadata
-pushing.
+via real NTP sync, with optional Icecast radio broadcasting, live listener
+counting and track metadata pushing.
 
 ## Features
 
@@ -11,28 +11,57 @@ pushing.
   position aligned with the actual wall-clock time.
 - **Automatic drift correction** — while playing, the track position is
   continuously compared to the true time; any drift beyond 300 ms triggers a
-  millisecond-precision `seekcur` correction.
+  millisecond-precision `seekcur` correction (with a 2.5 s cooldown).
 - **Manual tuning tweaks** — fine-tune the clock offset by +/-100 ms on the fly
   for hardware with extra latency (e.g. Android audio).
-- **Termux / Android support** — auto-detects Termux, switches the music
-  directory to `~/storage/music` and applies a 450 ms hardware-audio latency
-  profile.
+- **Now Playing panel** — shows the current playback state (`[ PLAY ]`,
+  `[ PAUSE ]`, `[ STOP ]`), track title, artist/album and a live progress bar
+  with elapsed/total time and percentage.
+- **Live NTP clock display** — the footer always shows the NTP-corrected time
+  and the applied offset.
+- **Playlist columns** — tracks are laid out in aligned columns with the playing
+  track marked `*` and highlighted green, the cursor row shown in reverse video,
+  and durations right-aligned. Long titles are truncated to the terminal width.
+- **Volume control** — `[` / `]` adjust MPD volume in 5% steps.
 - **FZF track search** — launch `fzf` over the music directory (filtered to
   audio files) and add multiple tracks to the playlist in one go. If a file
   isn't in MPD's database yet, it is rescanned and added automatically.
-- **Playlist management** — play, move, delete individual tracks, or clear the
-  whole queue.
+- **Playlist management** — play/pause, next, stop, move, delete individual
+  tracks, or clear the whole queue.
 - **Paginated playlist view** — page-by-page track list that follows the cursor,
-  with the currently playing track highlighted in green.
-- **Progress bar** — live ASCII progress bar with elapsed / total time.
+  with a page indicator.
 - **On Air radio broadcast** — one-key toggle (`b` / `r`) to enable or mute the
   Icecast streaming output.
+- **Live listener count** — polls Icecast's `status-json.xsl` every 10 s and
+  shows the number of connected listeners in the header (`[ ON AIR: N ]`) and
+  the footer.
 - **Icecast metadata push** — on every song change the `artist - title` is sent
   to the Icecast `admin/metadata` endpoint so listeners see the current track.
 - **Auto-recovery** — re-enables all disabled MPD audio outputs on play, on the
   `o` hotkey, and whenever MPD reports an error state.
-- **Live On Air header** — animated-style header banner showing `[ ON AIR ]` in
-  red when broadcasting, `[ OFF AIR ]` dimmed otherwise.
+- **Help overlay** — press `?` for a full keybinding reference.
+- **Termux / Android support** — auto-detects Termux, switches the music
+  directory to `~/storage/music` and applies a 450 ms hardware-audio latency
+  profile.
+
+## Interface
+
+```
+ // NTP TERMINAL MPD PLAYER v0.2 ////////////////////////// [ ON AIR: 3 ] //
+
+ [ PLAY ]  Tropic of Cancer - Awake
+           Tropic of Cancer  2024
+ [#####----------------------------------------] 0:41 / 5:12  (13%)
+ --------------------------------------------------------------------------
+ > 1. * Tropic of Cancer - Awake                                   [5:12]
+   2.   Some Artist - Some Title                                    [3:45]
+ ...
+   [ Page 1 / 3 | Shown 1-10 of 25 ]
+
+   NTP (pool.ntp.org): offset +12ms
+   Vol 80% | Clock 14:32:05 | Offset +12ms | Listeners 3
+   [k/j] Move | [Enter] Play/Pause | [n] Next | [s] Sync | [a] Add | [b/r] Radio | [x] Stop | [?] Help | [q] Quit
+```
 
 ## Keybindings
 
@@ -40,7 +69,11 @@ pushing.
 | -------------- | ----------------------------------------------- |
 | `k` / `up`     | Move cursor up                                  |
 | `j` / `down`   | Move cursor down                                |
-| `Enter`        | Play selected track                             |
+| `Enter`        | Play / pause toggle (starts selected track)     |
+| `n`            | Next track                                      |
+| `s`            | Force wall-clock sync now                       |
+| `x`            | Stop playback                                   |
+| `[` / `]`      | Volume down / up (5% steps)                     |
 | `a`            | Add music via FZF                               |
 | `d`            | Delete selected track                           |
 | `Delete`       | Clear the whole playlist                        |
@@ -50,6 +83,7 @@ pushing.
 | `o`            | Re-enable all audio outputs                     |
 | `+` / `=`      | Increase clock offset by +100 ms (tuning tweak) |
 | `-`            | Decrease clock offset by -100 ms (tuning tweak) |
+| `?`            | Toggle help overlay                             |
 | `q` / `Ctrl+C` | Quit                                            |
 
 ## How it works
@@ -59,10 +93,15 @@ pushing.
 - **Wall-clock alignment** — each time a track starts, it is seeked to the
   current second-of-the-system so the "top of the minute" of every track matches
   the real minute boundary. While playing, small drifts are corrected
-  continuously (with a 2.5 s cooldown to avoid seek fighting).
+  continuously (with a 2.5 s cooldown to avoid seek fighting). `s` forces the
+  alignment immediately.
 - **Broadcasting** — the Icecast stream is a regular MPD output. Toggling
   `b`/`r` simply enables/disables that output. On song change, the metadata is
   pushed over HTTP with Basic Auth to Icecast's admin interface.
+- **Listener counting** — every 10 s the public `status-json.xsl` endpoint is
+  polled (no auth needed) and the listener count for the configured mount is
+  shown in the header and footer. Both single-source and multi-source responses
+  are handled.
 
 ## Configuration
 
@@ -100,4 +139,14 @@ make fmt     # gofumpt -w .
 make lint    # golangci-lint run
 ```
 
-Requires MPD running locally on `localhost:6600`.
+An integration test against a live MPD daemon can be run with:
+
+```sh
+MPD_INTEGRATION=1 go test -run Integration -v
+```
+
+It is skipped automatically unless `MPD_INTEGRATION=1` is set, MPD is
+reachable on `localhost:6600`, and the queue is idle (so playback is never
+disturbed).
+
+Requires MPD running locally on `localhost:6600` and `fzf` for track search.
