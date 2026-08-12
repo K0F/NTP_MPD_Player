@@ -48,6 +48,8 @@ type model struct {
 // --- Icecast Metadata Push ---
 
 // icecastCfg holds the connection details for the Icecast source.
+// The password is read from the ICECAST_PASSWORD environment variable so it
+// never has to live in the source tree.
 var icecastCfg = struct {
 	host     string
 	port     string
@@ -58,7 +60,7 @@ var icecastCfg = struct {
 	host:     "192.168.1.101",
 	port:     "9000",
 	mount:    "/radio.mp3",
-	password: "cigareta",
+	password: os.Getenv("ICECAST_PASSWORD"),
 	user:     "source",
 }
 
@@ -136,8 +138,8 @@ func toggleBroadcast(client *mpd.Client) (bool, error) {
 
 	for _, out := range outputs {
 		idStr, hasID := out["outputid"]
-		name, _ := out["outputname"]
-		enabled, _ := out["outputenabled"]
+		name := out["outputname"]
+		enabled := out["outputenabled"]
 
 		if hasID && (strings.Contains(strings.ToLower(name), "icecast") || strings.Contains(strings.ToLower(name), "stream") || idStr == "1") {
 			if id, err := strconv.Atoi(idStr); err == nil {
@@ -152,7 +154,7 @@ func toggleBroadcast(client *mpd.Client) (bool, error) {
 		if idStr, ok := outputs[1]["outputid"]; ok {
 			if id, err := strconv.Atoi(idStr); err == nil {
 				targetID = id
-				enabled, _ := outputs[1]["outputenabled"]
+				enabled := outputs[1]["outputenabled"]
 				currentlyEnabled = (enabled == "1" || enabled == "true")
 			}
 		}
@@ -177,9 +179,9 @@ func isBroadcastActive(client *mpd.Client) bool {
 		return false
 	}
 	for _, out := range outputs {
-		idStr, _ := out["outputid"]
-		name, _ := out["outputname"]
-		enabled, _ := out["outputenabled"]
+		idStr := out["outputid"]
+		name := out["outputname"]
+		enabled := out["outputenabled"]
 
 		if strings.Contains(strings.ToLower(name), "icecast") || strings.Contains(strings.ToLower(name), "stream") || idStr == "1" {
 			return enabled == "1" || enabled == "true"
@@ -196,7 +198,7 @@ func renderHeader(version string, onAir bool, width int) string {
 		statusText = "[ ON AIR ]"
 		statusFormatted = "\033[1;31m[ ON AIR ]\033[0m"
 	}
-	rightLen := len(statusText) + 3
+	rightLen := len(statusText) + 4 // trailing " %s //" after fill
 
 	fillLen := width - len(left) - rightLen
 	if fillLen < 2 {
@@ -618,7 +620,11 @@ func renderProgressBar(elapsed, total float64, width int) string {
 
 	elSec := int(elapsed)
 	totSec := int(total)
-	return fmt.Sprintf("[%s] %d:%02d / %d:%02d",
+	if elSec < 0 {
+		elSec = 0
+	}
+	return fmt.Sprintf(
+		"[%s] %d:%02d / %d:%02d",
 		bar,
 		elSec/60, elSec%60,
 		totSec/60, totSec%60,
