@@ -32,6 +32,9 @@ counting and track metadata pushing.
   with a page indicator.
 - **On Air radio broadcast** — one-key toggle (`b` / `r`) to enable or mute the
   Icecast streaming output.
+- **Press-to-talk** — while ON AIR, `t` plays the live microphone over the
+  broadcast (via a local ffmpeg encoder fed into MPD); the current track is
+  paused and resumes when you release it.
 - **Live listener count** — polls Icecast's `status-json.xsl` every 10 s and
   shows the number of connected listeners in the header (`[ ON AIR: N ]`) and
   the footer.
@@ -60,7 +63,7 @@ counting and track metadata pushing.
 
    NTP (pool.ntp.org): offset +12ms
    Vol 80% | Clock 14:32:05 | Offset +12ms | Listeners 3
-   [k/j] Move | [Enter] Play/Pause | [n] Next | [s] Sync | [a] Add | [b/r] Radio | [x] Stop | [?] Help | [q] Quit
+   [k/j] Move | [Enter] Play | [n] Next | [s] Sync | [a] Add | [b/r] Radio | [t] Talk | [x] Stop | [?] Help | [q] Quit
 ```
 
 ## Keybindings
@@ -69,7 +72,7 @@ counting and track metadata pushing.
 | -------------- | ----------------------------------------------- |
 | `k` / `up`     | Move cursor up                                  |
 | `j` / `down`   | Move cursor down                                |
-| `Enter`        | Play / pause toggle (starts selected track)     |
+| `Enter`        | Play / skip to the selected track               |
 | `n`            | Next track                                      |
 | `s`            | Force wall-clock sync now                       |
 | `x`            | Stop playback                                   |
@@ -80,6 +83,7 @@ counting and track metadata pushing.
 | `PageUp`       | Move selected track up                          |
 | `PageDown`     | Move selected track down                        |
 | `b` / `r`      | Toggle On Air broadcast (Icecast output)        |
+| `t`            | Press-to-talk live mic on air (toggle)          |
 | `o`            | Re-enable all audio outputs                     |
 | `+` / `=`      | Increase clock offset by +100 ms (tuning tweak) |
 | `-`            | Decrease clock offset by -100 ms (tuning tweak) |
@@ -98,6 +102,12 @@ counting and track metadata pushing.
 - **Broadcasting** — the Icecast stream is a regular MPD output. Toggling
   `b`/`r` simply enables/disables that output. On song change, the metadata is
   pushed over HTTP with Basic Auth to Icecast's admin interface.
+- **Press-to-talk** — `t` (while on air) spawns `ffmpeg` encoding the default
+  Pulse/PipeWire microphone to mp3 on a local HTTP server
+  (`http://127.0.0.1:8123/live.mp3`), adds that stream to the MPD queue and
+  plays it, so the mic goes out on the broadcast. The current track position is
+  remembered and resumed when `t` is pressed again. Wall-clock seeking is
+  suspended while talking so the live stream is never seeked.
 - **Listener counting** — every 10 s the public `status-json.xsl` endpoint is
   polled (no auth needed) and the listener count for the configured mount is
   shown in the header and footer. Both single-source and multi-source responses
@@ -105,16 +115,17 @@ counting and track metadata pushing.
 
 ## Configuration
 
-Icecast connection details are hard-coded at the top of `main.go`:
+Icecast connection details are read from the `shout` `audio_output` block in
+the MPD config (host, port and mount), with the fallback defaults below:
 
-| Setting   | Default          |
-| --------- | ---------------- |
-| Host      | `192.168.1.101`  |
-| Port      | `9000`           |
-| Mount     | `/radio.mp3`     |
-| User      | `source`         |
+| Setting   | Default              |
+| --------- | -------------------- |
+| Host      | `xn--peek-h6a.com`   |
+| Port      | `9000`               |
+| Mount     | `/stream/radio.mp3`  |
+| User      | `source`             |
 | Password  | `ICECAST_PASSWORD` env var |
-| MPD host  | `localhost:6600` |
+| MPD host  | `localhost:6600`     |
 | Music dir | read from `music_directory` in MPD config |
 
 The music directory is read from the MPD config file (`music_directory`), not

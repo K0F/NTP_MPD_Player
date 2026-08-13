@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +10,22 @@ import (
 
 	"github.com/fhs/gompd/v2/mpd"
 )
+
+func TestPortListening(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("cannot create test listener: %v", err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	if !portListening(port) {
+		t.Errorf("portListening(%d) = false, want true for an open listener", port)
+	}
+	if portListening(59998) {
+		t.Error("portListening(59998) = true, want false for a closed port")
+	}
+}
 
 func TestParseMusicDir(t *testing.T) {
 	tests := []struct {
@@ -66,6 +83,66 @@ func TestParseMusicDir(t *testing.T) {
 			got := parseMusicDir(tt.config)
 			if got != tt.want {
 				t.Errorf("parseMusicDir(%q) = %q, want %q", tt.config, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseShoutOutput(t *testing.T) {
+	tests := []struct {
+		name   string
+		config string
+		want   shoutCfg
+	}{
+		{
+			name: "shout block among other outputs",
+			config: "audio_output {\n" +
+				"    type            \"pipewire\"\n" +
+				"    name            \"Speakers\"\n" +
+				"}\n" +
+				"audio_output {\n" +
+				"    type            \"shout\"\n" +
+				"    name            \"MPD Icecast Stream\"\n" +
+				"    host            \"stream.example.com\"\n" +
+				"    port            \"9000\"\n" +
+				"    mount           \"/live/radio.mp3\"\n" +
+				"}\n",
+			want: shoutCfg{host: "stream.example.com", port: "9000", mount: "/live/radio.mp3"},
+		},
+		{
+			name: "real style config",
+			config: "music_directory \"/mnt/data/Music\"\n" +
+				"audio_output {\n" +
+				"    type            \"shout\"\n" +
+				"    name            \"MPD Icecast Stream\"\n" +
+				"    host            \"xn--peek-h6a.com\"\n" +
+				"    port            \"9000\"\n" +
+				"    mount           \"/stream/radio.mp3\"\n" +
+				"    password        \"secret\"\n" +
+				"}\n",
+			want: shoutCfg{host: "xn--peek-h6a.com", port: "9000", mount: "/stream/radio.mp3"},
+		},
+		{
+			name:   "no shout block",
+			config: "audio_output { type \"pipewire\" name \"x\" }\n",
+			want:   shoutCfg{},
+		},
+		{
+			name:   "empty config",
+			config: "",
+			want:   shoutCfg{},
+		},
+		{
+			name:   "comments ignored",
+			config: "# audio_output { type shout host \"x\" }\naudio_output { type \"pipewire\" }\n",
+			want:   shoutCfg{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := parseShoutOutput(tt.config); got != tt.want {
+				t.Errorf("parseShoutOutput() = %+v, want %+v", got, tt.want)
 			}
 		})
 	}
@@ -390,6 +467,17 @@ func TestParseIcecastListeners(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("real stream mount with path prefix", func(t *testing.T) {
+		body := `{"icestats":{"source":{"listeners":4,"listenurl":"http://xn--peek-h6a.com:9000/stream/radio.mp3"}}}`
+		got, err := parseIcecastListeners([]byte(body), "/stream/radio.mp3")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != 4 {
+			t.Errorf("parseIcecastListeners() = %d, want 4", got)
+		}
+	})
 
 	t.Run("malformed json errors", func(t *testing.T) {
 		if _, err := parseIcecastListeners([]byte("{nope"), mount); err == nil {

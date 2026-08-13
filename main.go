@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	ntplib "github.com/beevik/ntp"
@@ -50,12 +51,19 @@ type model struct {
 	showHelp          bool
 	listeners         int
 	volume            int
+	pttActive         bool
+	pttSavedPos       int
+	pttSavedState     string
+	pttCmd            *exec.Cmd
 }
 
 // --- Icecast Metadata Push ---
 
-// The Icecast source password comes from the environment so it never has to
-// live in the source tree.
+// icecastCfg holds the connection details for the Icecast source. host, port
+// and mount are read from the "shout" audio_output in the MPD config so the
+// player always polls and updates the same server the stream is actually sent
+// to, falling back to the defaults below. The source password comes from the
+// environment so it never has to live in the source tree.
 var icecastCfg = struct {
 	host     string
 	port     string
@@ -63,11 +71,19 @@ var icecastCfg = struct {
 	password string
 	user     string
 }{
-	host:     "192.168.1.101",
+	host:     "xn--peek-h6a.com",
 	port:     "9000",
-	mount:    "/radio.mp3",
+	mount:    "/stream/radio.mp3",
 	password: os.Getenv("ICECAST_PASSWORD"),
 	user:     "source",
+}
+
+func init() {
+	if shout := mpdShoutOutput(); shout.host != "" {
+		icecastCfg.host = shout.host
+		icecastCfg.port = shout.port
+		icecastCfg.mount = shout.mount
+	}
 }
 
 func pushIcecastMeta(artist, title string) {
@@ -275,6 +291,141 @@ func isBroadcastActive(client *mpd.Client) bool {
 	return false
 }
 
+// --- Press-To-Talk ---
+
+// pttStreamURL is the local HTTP endpoint ffmpeg streams the live microphone
+// to while Press-To-Talk is active; MPD plays it so it goes out on the Icecast
+// broadcast alongside normal playback.
+const (
+	pttStreamURL  = "http://127.0.0.1:8123/live.mp3"
+	pttStreamPort = 8123
+)
+
+// portListening reports whether a TCP socket on localhost is in LISTEN state,
+// read from /proc so we never burn the encoder's single-client connection by
+// probing it ourselves.
+func portListening(port int) bool {
+	hexPort := fmt.Sprintf(":%04X", port)
+	for _, file := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) < 4 {
+				continue
+			}
+			if strings.HasSuffix(fields[1], hexPort) && fields[3] == "0A" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (m *model) findPTTStreamPos() (int, bool) {
+	for i, t := range m.playlist {
+		if t["file"] == pttStreamURL {
+			return i, true
+		}
+	}
+	return -1, false
+}
+
+// startPTT brings the live microphone on air: it saves the current playback
+// position, starts a local ffmpeg HTTP server that encodes the mic as mp3,
+// adds that stream to the queue and plays it.
+func (m *model) startPTT() error {
+	st, err := m.client.Status()
+	if err != nil {
+		return err
+	}
+	pos := -1
+	if p, err := strconv.Atoi(st["song"]); err == nil {
+		pos = p
+	}
+
+	cmd := exec.Command(
+		"ffmpeg",
+		"-hide_banner", "-loglevel", "error",
+		"-f", "pulse", "-i", "default",
+		"-c:a", "libmp3lame", "-f", "mp3",
+		"-listen", "1", pttStreamURL,
+	)
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("cannot start mic encoder: %v", err)
+	}
+
+	// The encoder needs a moment to open its listening socket; MPD must not try
+	// to connect before it is ready, so wait for the port to enter LISTEN state.
+	deadline := time.Now().Add(3 * time.Second)
+	for !portListening(pttStreamPort) {
+		if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
+			return fmt.Errorf("mic encoder exited before starting: %v", err)
+		}
+		if time.Now().After(deadline) {
+			_ = cmd.Process.Kill()
+			return fmt.Errorf("mic encoder did not start listening in time")
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	if err := m.client.Add(pttStreamURL); err != nil {
+		_ = cmd.Process.Kill()
+		return fmt.Errorf("cannot add mic stream: %v", err)
+	}
+	if err := m.client.Play(len(m.playlist)); err != nil {
+		_ = cmd.Process.Kill()
+		return fmt.Errorf("cannot play mic stream: %v", err)
+	}
+
+	m.pttCmd = cmd
+	m.pttSavedPos = pos
+	m.pttSavedState = st["state"]
+	m.pttActive = true
+	return nil
+}
+
+// stopPTT takes the mic off the air: it kills the encoder, drops the stream
+// from the queue and resumes the track that was playing before.
+func (m *model) stopPTT() error {
+	if m.pttCmd != nil && m.pttCmd.Process != nil {
+		_ = m.pttCmd.Process.Kill()
+		_ = m.pttCmd.Wait()
+		m.pttCmd = nil
+	}
+
+	if pos, ok := m.findPTTStreamPos(); ok {
+		_ = m.client.Delete(pos, -1)
+	}
+
+	if m.pttSavedPos >= 0 {
+		_ = m.client.Play(m.pttSavedPos)
+		if m.pttSavedState == "pause" {
+			_ = m.client.Pause(true)
+		}
+		m.syncCooldownUntil = time.Now().Add(2500 * time.Millisecond)
+	} else if m.pttSavedState == "" || m.pttSavedState == "stop" {
+		_ = m.client.Stop()
+	}
+
+	m.pttActive = false
+	m.pttSavedPos = -1
+	m.pttSavedState = ""
+	return nil
+}
+
+// dropPTT stops press-to-talk if it is active and returns a command to refresh
+// the playlist, or nil when nothing needed stopping.
+func (m *model) dropPTT() tea.Cmd {
+	if !m.pttActive {
+		return nil
+	}
+	_ = m.stopPTT()
+	return fetchPlaylist(m.client)
+}
+
 func renderHeader(version string, onAir bool, listeners int, width int) string {
 	left := fmt.Sprintf(" // NTP TERMINAL MPD PLAYER v%s ", version)
 	statusText := "[ OFF AIR ]"
@@ -430,6 +581,87 @@ func parseMusicDir(config string) string {
 	return ""
 }
 
+type shoutCfg struct {
+	host  string
+	port  string
+	mount string
+}
+
+// quotedConfigValue extracts the first double-quoted string from line.
+func quotedConfigValue(line string) string {
+	if i := strings.Index(line, `"`); i != -1 {
+		if j := strings.Index(line[i+1:], `"`); j != -1 {
+			return line[i+1 : i+1+j]
+		}
+	}
+	return ""
+}
+
+// parseShoutOutput extracts host/port/mount from the audio_output block whose
+// type is "shout" in the MPD config content.
+func parseShoutOutput(config string) shoutCfg {
+	var out shoutCfg
+	var inBlock, inShout bool
+	for _, line := range strings.Split(config, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "audio_output") && strings.HasSuffix(trimmed, "{") {
+			inBlock = true
+			inShout = false
+			continue
+		}
+		if !inBlock {
+			continue
+		}
+		if trimmed == "}" {
+			inBlock = false
+			inShout = false
+			continue
+		}
+		if strings.HasPrefix(trimmed, "type") {
+			inShout = quotedConfigValue(trimmed) == "shout"
+			continue
+		}
+		if !inShout {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(trimmed, "host"):
+			out.host = quotedConfigValue(trimmed)
+		case strings.HasPrefix(trimmed, "port"):
+			out.port = quotedConfigValue(trimmed)
+		case strings.HasPrefix(trimmed, "mount"):
+			out.mount = quotedConfigValue(trimmed)
+		}
+	}
+	return out
+}
+
+func mpdShoutOutput() shoutCfg {
+	home, _ := os.UserHomeDir()
+	var configPaths []string
+	if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
+		configPaths = append(configPaths, filepath.Join(xdg, "mpd", "mpd.conf"))
+	}
+	if home != "" {
+		configPaths = append(configPaths, filepath.Join(home, ".config", "mpd", "mpd.conf"))
+	}
+	configPaths = append(configPaths, "/etc/mpd.conf")
+
+	for _, path := range configPaths {
+		content, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		if shout := parseShoutOutput(string(content)); shout.host != "" || shout.mount != "" {
+			return shout
+		}
+	}
+	return shoutCfg{}
+}
+
 func mpdMusicDir() string {
 	home, _ := os.UserHomeDir()
 	var configPaths []string
@@ -489,6 +721,7 @@ func initialModel(ntpOffset time.Duration, ntpMsg string) model {
 		showHelp:          false,
 		listeners:         -1,
 		volume:            -1,
+		pttSavedPos:       -1,
 	}
 }
 
@@ -508,6 +741,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "q", "ctrl+c":
+			if m.pttCmd != nil && m.pttCmd.Process != nil {
+				_ = m.pttCmd.Process.Kill()
+			}
 			return m, tea.Quit
 
 		case "up", "k":
@@ -520,30 +756,40 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "enter":
-			ensureOutputsEnabled(m.client)
-			st, err := m.client.Status()
-			if err != nil {
-				m.ntpStatus = fmt.Sprintf("Status error: %v", err)
-				return m, nil
+			if cmd := m.dropPTT(); cmd != nil {
+				m.ntpStatus = "PTT stopped"
+				return m, cmd
 			}
-			switch st["state"] {
-			case "play":
-				_ = m.client.Pause(true)
-				m.ntpStatus = "Paused"
-			case "pause":
-				_ = m.client.Pause(false)
+			if len(m.playlist) > 0 && m.cursor >= 0 && m.cursor < len(m.playlist) {
+				ensureOutputsEnabled(m.client)
+				_ = m.client.Play(m.cursor)
 				m.syncCooldownUntil = time.Now().Add(2500 * time.Millisecond)
-				m.ntpStatus = "Resumed"
-			default:
-				if len(m.playlist) > 0 && m.cursor < len(m.playlist) {
-					_ = m.client.Play(m.cursor)
+				m.ntpStatus = "Playing"
+			} else {
+				st, err := m.client.Status()
+				if err != nil {
+					m.ntpStatus = fmt.Sprintf("Status error: %v", err)
+					return m, nil
+				}
+				switch st["state"] {
+				case "play":
+					_ = m.client.Pause(true)
+					m.ntpStatus = "Paused"
+				case "pause":
+					_ = m.client.Pause(false)
 					m.syncCooldownUntil = time.Now().Add(2500 * time.Millisecond)
-					m.ntpStatus = "Playing"
+					m.ntpStatus = "Resumed"
+				default:
+					m.ntpStatus = "No track selected"
 				}
 			}
 			return m, nil
 
 		case "n":
+			if cmd := m.dropPTT(); cmd != nil {
+				m.ntpStatus = "PTT stopped"
+				return m, cmd
+			}
 			ensureOutputsEnabled(m.client)
 			if err := m.client.Next(); err != nil {
 				m.ntpStatus = fmt.Sprintf("Next error: %v", err)
@@ -554,6 +800,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case "s":
+			if cmd := m.dropPTT(); cmd != nil {
+				m.ntpStatus = "PTT stopped"
+				return m, cmd
+			}
 			ensureOutputsEnabled(m.client)
 			if targetSec, ok := wallClockTargetSec(m.clockOffset, m.currentStatus["duration"]); ok {
 				preciseSeekRaw(targetSec)
@@ -565,6 +815,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case "x":
+			if cmd := m.dropPTT(); cmd != nil {
+				m.ntpStatus = "PTT stopped"
+				return m, cmd
+			}
 			_ = m.client.Stop()
 			m.ntpStatus = "Stopped"
 			return m, nil
@@ -609,15 +863,44 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case "b", "r":
+			wasPTT := m.pttActive
 			onAir, err := toggleBroadcast(m.client)
 			if err != nil {
 				m.ntpStatus = fmt.Sprintf("Broadcast Error: %v", err)
 			} else if onAir {
 				m.ntpStatus = "[ON AIR] Broadcast Active (Icecast)"
 			} else {
-				m.ntpStatus = "[OFF AIR] Broadcast Muted (Icecast)"
+				if wasPTT {
+					_ = m.stopPTT()
+					m.ntpStatus = "[OFF AIR] Broadcast Muted; PTT stopped"
+				} else {
+					m.ntpStatus = "[OFF AIR] Broadcast Muted (Icecast)"
+				}
+			}
+			if wasPTT {
+				return m, fetchPlaylist(m.client)
 			}
 			return m, nil
+
+		case "t":
+			if !isBroadcastActive(m.client) {
+				m.ntpStatus = "PTT: not on air"
+				return m, nil
+			}
+			if m.pttActive {
+				if err := m.stopPTT(); err != nil {
+					m.ntpStatus = fmt.Sprintf("PTT error: %v", err)
+					return m, nil
+				}
+				m.ntpStatus = "PTT off"
+			} else {
+				if err := m.startPTT(); err != nil {
+					m.ntpStatus = fmt.Sprintf("PTT error: %v", err)
+					return m, nil
+				}
+				m.ntpStatus = "PTT: live mic on air"
+			}
+			return m, fetchPlaylist(m.client)
 
 		case "a":
 			return m, runFzf(m.musicDir)
@@ -710,28 +993,41 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		// While press-to-talk is live, never let wall-clock sync or metadata
+		// push touch the mic stream; MPD must hold a single connection to the
+		// local encoder, and a seek would force a reconnect that kills it.
+		if m.pttActive {
+			return m, syncEngine(m.client)
+		}
+
 		if currentSongID != "" && currentSongID != m.lastSongID && m.playlist != nil {
 			m.lastSongID = currentSongID
 
+			isPTT := false
 			if songPos >= 0 && songPos < len(m.playlist) {
-				track := m.playlist[songPos]
-				artist := track["artist"]
-				title := track["title"]
-				if title == "" {
-					parts := strings.Split(track["file"], "/")
-					title = parts[len(parts)-1]
+				isPTT = m.playlist[songPos]["file"] == pttStreamURL
+				if !isPTT {
+					track := m.playlist[songPos]
+					artist := track["artist"]
+					title := track["title"]
+					if title == "" {
+						parts := strings.Split(track["file"], "/")
+						title = parts[len(parts)-1]
+					}
+					pushIcecastMeta(artist, title)
 				}
-				pushIcecastMeta(artist, title)
 			}
 
-			trueTime := time.Now().Add(m.clockOffset)
-			targetSec := float64(trueTime.Second()) + float64(trueTime.Nanosecond())/1e9
+			if !isPTT {
+				trueTime := time.Now().Add(m.clockOffset)
+				targetSec := float64(trueTime.Second()) + float64(trueTime.Nanosecond())/1e9
 
-			if totalTrackDuration > 0 {
-				targetSec = math.Mod(targetSec, totalTrackDuration)
-				preciseSeekRaw(targetSec)
-			} else {
-				preciseSeekRaw(0.0)
+				if totalTrackDuration > 0 {
+					targetSec = math.Mod(targetSec, totalTrackDuration)
+					preciseSeekRaw(targetSec)
+				} else {
+					preciseSeekRaw(0.0)
+				}
 			}
 
 			m.syncCooldownUntil = time.Now().Add(2500 * time.Millisecond)
@@ -933,7 +1229,7 @@ func renderNowPlaying(m model, width int) string {
 func renderHelp(width int) string {
 	rows := []struct{ key, desc string }{
 		{"k/j, up/down", "move cursor"},
-		{"enter", "play / pause toggle"},
+		{"enter", "play selected track"},
 		{"n", "next track"},
 		{"s", "sync to wall clock"},
 		{"x", "stop"},
@@ -943,6 +1239,7 @@ func renderHelp(width int) string {
 		{"d / delete", "delete track / clear queue"},
 		{"pgup / pgdown", "move track in queue"},
 		{"b / r", "toggle On Air radio"},
+		{"t", "press-to-talk live mic (on air)"},
 		{"o", "re-enable audio outputs"},
 		{"? / q", "toggle help / quit"},
 	}
@@ -1016,7 +1313,7 @@ func (m model) View() string {
 
 	s.WriteString("\n  " + m.ntpStatus + "\n")
 	s.WriteString("  " + strings.Join(info, " | ") + "\n")
-	s.WriteString("  [k/j] Move | [Enter] Play/Pause | [n] Next | [s] Sync | [a] Add | [b/r] Radio | [x] Stop | [?] Help | [q] Quit\n")
+	s.WriteString("  [k/j] Move | [Enter] Play | [n] Next | [s] Sync | [a] Add | [b/r] Radio | [t] Talk | [x] Stop | [?] Help | [q] Quit\n")
 
 	return s.String()
 }
