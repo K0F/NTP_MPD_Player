@@ -1366,7 +1366,15 @@ func queryNTP() (time.Duration, string) {
 			if srv == "xn--peek-h6a.com" || srv == "192.168.1.101" || srv == "10.39.10.1" || srv == "pesek.com" {
 				displaySrv = "pešek.com"
 			}
-			msg := fmt.Sprintf("NTP (%s): offset %s%dms", displaySrv, sign, offset.Milliseconds())
+			var offsetStr string
+			if offset < time.Millisecond {
+				offsetStr = fmt.Sprintf("%s%dµs", sign, offset.Microseconds())
+			} else if offset < 10*time.Millisecond {
+				offsetStr = fmt.Sprintf("%s%.2fms", sign, float64(offset.Microseconds())/1000.0)
+			} else {
+				offsetStr = fmt.Sprintf("%s%dms", sign, offset.Milliseconds())
+			}
+			msg := fmt.Sprintf("NTP (%s): offset %s", displaySrv, offsetStr)
 			return resp.ClockOffset, msg
 		}
 	}
