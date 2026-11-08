@@ -120,7 +120,7 @@ func TestParseShoutOutput(t *testing.T) {
 				"    mount           \"/stream/radio.mp3\"\n" +
 				"    password        \"secret\"\n" +
 				"}\n",
-			want: shoutCfg{host: "xn--peek-h6a.com", port: "9000", mount: "/stream/radio.mp3"},
+			want: shoutCfg{host: "xn--peek-h6a.com", port: "9000", mount: "/stream/radio.mp3", password: "secret"},
 		},
 		{
 			name:   "no shout block",
@@ -620,4 +620,12 @@ func TestRenderTrackRow(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestQueryNTP(t *testing.T) {
+	_, msg := queryNTP()
+	if !strings.HasPrefix(msg, "NTP") {
+		t.Errorf("queryNTP() message %q does not start with 'NTP'", msg)
+	}
+	t.Logf("queryNTP() returned: %s", msg)
 }

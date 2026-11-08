@@ -79,10 +79,22 @@ var icecastCfg = struct {
 }
 
 func init() {
-	if shout := mpdShoutOutput(); shout.host != "" {
-		icecastCfg.host = shout.host
-		icecastCfg.port = shout.port
-		icecastCfg.mount = shout.mount
+	if shout := mpdShoutOutput(); shout.host != "" || shout.mount != "" {
+		if shout.host != "" {
+			icecastCfg.host = shout.host
+		}
+		if shout.port != "" {
+			icecastCfg.port = shout.port
+		}
+		if shout.mount != "" {
+			icecastCfg.mount = shout.mount
+		}
+		if icecastCfg.password == "" && shout.password != "" {
+			icecastCfg.password = shout.password
+		}
+		if shout.user != "" {
+			icecastCfg.user = shout.user
+		}
 	}
 }
 
@@ -582,9 +594,11 @@ func parseMusicDir(config string) string {
 }
 
 type shoutCfg struct {
-	host  string
-	port  string
-	mount string
+	host     string
+	port     string
+	mount    string
+	password string
+	user     string
 }
 
 // quotedConfigValue extracts the first double-quoted string from line.
@@ -634,6 +648,10 @@ func parseShoutOutput(config string) shoutCfg {
 			out.port = quotedConfigValue(trimmed)
 		case strings.HasPrefix(trimmed, "mount"):
 			out.mount = quotedConfigValue(trimmed)
+		case strings.HasPrefix(trimmed, "password"):
+			out.password = quotedConfigValue(trimmed)
+		case strings.HasPrefix(trimmed, "user"):
+			out.user = quotedConfigValue(trimmed)
 		}
 	}
 	return out
@@ -1320,12 +1338,23 @@ func (m model) View() string {
 
 func queryNTP() (time.Duration, string) {
 	servers := []string{
+		"pešek.com",
+		"xn--peek-h6a.com",
+		"pesek.com",
+		"192.168.1.101",
+		"10.39.10.1",
+		"tik.cesnet.cz",
+		"tak.cesnet.cz",
+		"ntp.nic.cz",
 		"pool.ntp.org",
 		"time.cloudflare.com",
 		"time.google.com",
 	}
+	opts := ntplib.QueryOptions{
+		Timeout: 1500 * time.Millisecond,
+	}
 	for _, srv := range servers {
-		resp, err := ntplib.Query(srv)
+		resp, err := ntplib.QueryWithOptions(srv, opts)
 		if err == nil {
 			offset := resp.ClockOffset
 			sign := "+"
@@ -1333,7 +1362,11 @@ func queryNTP() (time.Duration, string) {
 				sign = "-"
 				offset = -offset
 			}
-			msg := fmt.Sprintf("NTP (%s): offset %s%dms", srv, sign, offset.Milliseconds())
+			displaySrv := srv
+			if srv == "xn--peek-h6a.com" || srv == "192.168.1.101" || srv == "10.39.10.1" || srv == "pesek.com" {
+				displaySrv = "pešek.com"
+			}
+			msg := fmt.Sprintf("NTP (%s): offset %s%dms", displaySrv, sign, offset.Milliseconds())
 			return resp.ClockOffset, msg
 		}
 	}
